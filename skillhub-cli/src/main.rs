@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use flate2::{Compression, write::GzEncoder};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tar::{Builder, Header};
 use tempfile::TempDir;
 
@@ -137,6 +138,20 @@ struct Manifest {
     skills: std::collections::BTreeMap<String, String>,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct Lockfile {
+    #[serde(default)]
+    skill: Vec<LockedSkill>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LockedSkill {
+    name: String,
+    source: String,
+    resolved: String,
+    checksum: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct InstallConfig {
     target: PathBuf,
@@ -173,6 +188,61 @@ fn write_manifest(manifest_path: &Path, manifest: &Manifest) -> Result<()> {
     let contents = toml::to_string_pretty(manifest).context("failed to serialize manifest")?;
     fs::write(manifest_path, contents)
         .with_context(|| format!("failed to write {}", manifest_path.display()))
+}
+
+fn lockfile_path_for(manifest_path: &Path) -> PathBuf {
+    manifest_path.with_file_name("skillhub.lock")
+}
+
+fn read_lockfile(lockfile_path: &Path) -> Result<Lockfile> {
+    if !lockfile_path.exists() {
+        return Ok(Lockfile::default());
+    }
+
+    let contents = fs::read_to_string(lockfile_path)
+        .with_context(|| format!("failed to read {}", lockfile_path.display()))?;
+    toml::from_str(&contents)
+        .with_context(|| format!("failed to parse {}", lockfile_path.display()))
+}
+
+fn write_lockfile(lockfile_path: &Path, lockfile: &Lockfile) -> Result<()> {
+    let contents = toml::to_string_pretty(lockfile).context("failed to serialize lockfile")?;
+    fs::write(lockfile_path, contents)
+        .with_context(|| format!("failed to write {}", lockfile_path.display()))
+}
+
+fn upsert_lock(lockfile: &mut Lockfile, locked_skill: LockedSkill) {
+    if let Some(existing) = lockfile
+        .skill
+        .iter_mut()
+        .find(|skill| skill.name == locked_skill.name)
+    {
+        *existing = locked_skill;
+    } else {
+        lockfile.skill.push(locked_skill);
+    }
+    lockfile
+        .skill
+        .sort_by(|left, right| left.name.cmp(&right.name));
+}
+
+fn checksum_dir(path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for file in collect_files(path)? {
+        let relative_path = file.strip_prefix(path).with_context(|| {
+            format!(
+                "failed to make {} relative to {}",
+                file.display(),
+                path.display()
+            )
+        })?;
+        hasher.update(relative_path.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        hasher
+            .update(fs::read(&file).with_context(|| format!("failed to read {}", file.display()))?);
+        hasher.update([0]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn add_skill(manifest_path: &Path, source: &str) -> Result<()> {
