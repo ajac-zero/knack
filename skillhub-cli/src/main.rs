@@ -97,7 +97,7 @@ fn main() -> Result<()> {
         }
         Command::Install { source, target } => {
             let installed = install_skill(&source, &target)?;
-            println!("installed skill: {}", installed.display());
+            println!("installed skill: {}", installed.path.display());
         }
         Command::List { target } => {
             list_skills(&target)?;
@@ -152,7 +152,13 @@ fn write_manifest(manifest_path: &Path, manifest: &Manifest) -> Result<()> {
         .with_context(|| format!("failed to write {}", manifest_path.display()))
 }
 
-fn install_skill(source: &str, target: &PathBuf) -> Result<PathBuf> {
+#[derive(Debug)]
+struct InstalledSkill {
+    name: String,
+    path: PathBuf,
+}
+
+fn install_skill(source: &str, target: &PathBuf) -> Result<InstalledSkill> {
     fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
 
     if let Some(spec) = source.strip_prefix("gh:") {
@@ -165,7 +171,7 @@ fn install_skill(source: &str, target: &PathBuf) -> Result<PathBuf> {
     install_local_skill(&source, target)
 }
 
-fn install_local_skill(source: &PathBuf, target: &PathBuf) -> Result<PathBuf> {
+fn install_local_skill(source: &PathBuf, target: &PathBuf) -> Result<InstalledSkill> {
     if source.is_dir() {
         return install_skill_dir(source, target);
     }
@@ -185,7 +191,11 @@ fn install_local_skill(source: &PathBuf, target: &PathBuf) -> Result<PathBuf> {
             .with_context(|| format!("failed to unpack {}", source.display()))?;
         let skill = read_skill(&destination)?;
         validate_skill(&skill)?;
-        return Ok(destination);
+        let skill = read_skill(&destination)?;
+        return Ok(InstalledSkill {
+            name: skill.name,
+            path: destination,
+        });
     }
 
     bail!("install source does not exist: {}", source.display());
@@ -299,7 +309,7 @@ fn single_child_dir(path: &Path) -> Result<PathBuf> {
     Ok(child)
 }
 
-fn install_skill_dir(source: &Path, target: &Path) -> Result<PathBuf> {
+fn install_skill_dir(source: &Path, target: &Path) -> Result<InstalledSkill> {
     let skill = read_skill(source)?;
     validate_skill(&skill)?;
     let destination = target.join(&skill.name);
@@ -307,7 +317,10 @@ fn install_skill_dir(source: &Path, target: &Path) -> Result<PathBuf> {
         bail!("skill already installed: {}", destination.display());
     }
     copy_dir(source, &destination)?;
-    Ok(destination)
+    Ok(InstalledSkill {
+        name: skill.name,
+        path: destination,
+    })
 }
 
 fn list_skills(target: &PathBuf) -> Result<()> {
