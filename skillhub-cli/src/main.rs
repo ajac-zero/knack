@@ -32,6 +32,16 @@ enum Command {
         target: PathBuf,
     },
 
+    /// Install a skill source and record it in the project manifest.
+    Add {
+        /// Path, archive, or gh: source to add.
+        source: String,
+
+        /// Path to the project manifest.
+        #[arg(long, default_value = "skillhub.toml")]
+        manifest: PathBuf,
+    },
+
     /// Create a new skill directory.
     New {
         /// Skill name. Must be lowercase letters, numbers, and hyphens.
@@ -82,6 +92,9 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Init { manifest, target } => {
             init_manifest(&manifest, &target)?;
+        }
+        Command::Add { source, manifest } => {
+            add_skill(&manifest, &source)?;
         }
         Command::New { name, dir } => {
             new_skill(&name, dir)?;
@@ -150,6 +163,17 @@ fn write_manifest(manifest_path: &Path, manifest: &Manifest) -> Result<()> {
     let contents = toml::to_string_pretty(manifest).context("failed to serialize manifest")?;
     fs::write(manifest_path, contents)
         .with_context(|| format!("failed to write {}", manifest_path.display()))
+}
+
+fn add_skill(manifest_path: &Path, source: &str) -> Result<()> {
+    let mut manifest = read_manifest(manifest_path)?;
+    let installed = install_skill(source, &manifest.install.target)?;
+    manifest
+        .skills
+        .insert(installed.name.clone(), source.to_string());
+    write_manifest(manifest_path, &manifest)?;
+    println!("added skill: {} from {}", installed.name, source);
+    Ok(())
 }
 
 #[derive(Debug)]
