@@ -42,6 +42,13 @@ enum Command {
         manifest: PathBuf,
     },
 
+    /// Install all skills declared in the project manifest.
+    Sync {
+        /// Path to the project manifest.
+        #[arg(long, default_value = "skillhub.toml")]
+        manifest: PathBuf,
+    },
+
     /// Create a new skill directory.
     New {
         /// Skill name. Must be lowercase letters, numbers, and hyphens.
@@ -95,6 +102,9 @@ fn main() -> Result<()> {
         }
         Command::Add { source, manifest } => {
             add_skill(&manifest, &source)?;
+        }
+        Command::Sync { manifest } => {
+            sync_skills(&manifest)?;
         }
         Command::New { name, dir } => {
             new_skill(&name, dir)?;
@@ -174,6 +184,28 @@ fn add_skill(manifest_path: &Path, source: &str) -> Result<()> {
     write_manifest(manifest_path, &manifest)?;
     println!("added skill: {} from {}", installed.name, source);
     Ok(())
+}
+
+fn sync_skills(manifest_path: &Path) -> Result<()> {
+    let manifest = read_manifest(manifest_path)?;
+    fs::create_dir_all(&manifest.install.target)
+        .with_context(|| format!("failed to create {}", manifest.install.target.display()))?;
+
+    for (name, source) in &manifest.skills {
+        if is_skill_installed(name, &manifest.install.target) {
+            println!("already installed: {name}");
+            continue;
+        }
+
+        let installed = install_skill(source, &manifest.install.target)?;
+        println!("synced skill: {}", installed.name);
+    }
+
+    Ok(())
+}
+
+fn is_skill_installed(name: &str, target: &Path) -> bool {
+    target.join(name).join("SKILL.md").is_file()
 }
 
 #[derive(Debug)]
