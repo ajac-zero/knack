@@ -247,11 +247,23 @@ fn checksum_dir(path: &Path) -> Result<String> {
 
 fn add_skill(manifest_path: &Path, source: &str) -> Result<()> {
     let mut manifest = read_manifest(manifest_path)?;
+    let lockfile_path = lockfile_path_for(manifest_path);
+    let mut lockfile = read_lockfile(&lockfile_path)?;
     let installed = install_skill(source, &manifest.install.target)?;
     manifest
         .skills
         .insert(installed.name.clone(), source.to_string());
+    upsert_lock(
+        &mut lockfile,
+        LockedSkill {
+            name: installed.name.clone(),
+            source: source.to_string(),
+            resolved: source.to_string(),
+            checksum: checksum_dir(&installed.path)?,
+        },
+    );
     write_manifest(manifest_path, &manifest)?;
+    write_lockfile(&lockfile_path, &lockfile)?;
     println!("added skill: {} from {}", installed.name, source);
     Ok(())
 }
