@@ -37,6 +37,19 @@ cargo run -p skillhub-cli -- install rust-code-review --target .agents/skills
 cargo run -p skillhub-cli -- install dist/rust-code-review.skill.tar.gz --target .agents/skills
 ```
 
+Install directly from a public GitHub repository:
+
+```bash
+cargo run -p skillhub-cli -- install gh:owner/repo/path/to/skill --target .agents/skills
+cargo run -p skillhub-cli -- install gh:owner/repo@ref/path/to/skill --target .agents/skills
+```
+
+For example:
+
+```bash
+cargo run -p skillhub-cli -- install gh:anthropics/skills/skills/pdf --target .agents/skills
+```
+
 List installed skills:
 
 ```bash
@@ -51,6 +64,7 @@ Implemented:
 - Agent Skills frontmatter validation.
 - Deterministic `.skill.tar.gz` packaging.
 - Local installation from directories and package archives.
+- GitHub installation with `gh:owner/repo[@ref]/path/to/skill`.
 - Listing installed skills.
 
 Not implemented yet:
