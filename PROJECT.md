@@ -153,6 +153,15 @@ The project should support a low-friction registry path first:
 - Deterministic packaged artifacts with checksums.
 - Searchable metadata index.
 
+GitHub should also be supported as an early first-class source backend. This lets users install a skill directly from a repository path without running any registry infrastructure:
+
+```bash
+skillhub install gh:owner/repo/path/to/skill
+skillhub install gh:owner/repo@v1.2.0/path/to/skill
+```
+
+This is not a replacement for the long-term registry. It is a pragmatic bridge that makes `skillhub` easy to try, works naturally for OSS skills, and gives teams a simple private-sharing path through GitHub repositories.
+
 A full self-hosted server can follow:
 
 - Rust HTTP service.
@@ -180,6 +189,10 @@ The package may include optional registry metadata, but `SKILL.md` remains the c
 ### Registry
 
 A registry is a source of package metadata and artifacts. Registries can be static, Git-backed, or served by the `skillhub` registry server.
+
+### Source
+
+A source is any location `skillhub install` can resolve into a skill directory. Initial sources include local directories, local package archives, and GitHub repository paths. Future sources include static registries, Git repositories, and the `skillhub` registry server.
 
 ### Manifest
 
@@ -236,6 +249,7 @@ MVP goals:
 - Validate `SKILL.md` frontmatter and directory rules.
 - Package a skill into a deterministic archive.
 - Install a skill from a local path or artifact.
+- Install a skill from a GitHub repository path with `gh:owner/repo[@ref]/path/to/skill`.
 - Install into `.agents/skills/` by default.
 - Maintain a project manifest and lockfile.
 - Sync a project from its manifest and lockfile.
@@ -259,6 +273,7 @@ Important later capabilities:
 - Self-hosted registry server.
 - Auth tokens, namespaces, owners, and publish permissions.
 - OIDC support.
+- GitHub token support for private repositories and higher API limits.
 - Skill signing and verification.
 - Provenance from GitHub Actions, GitLab CI, or other CI systems.
 - Policy engine for organization rules.
@@ -291,6 +306,7 @@ Important later capabilities:
 - Should project manifests be named `skills.toml`, `skillhub.toml`, or something else?
 - How strict should validation be by default versus compatibility mode?
 - Which client-specific install targets should be supported after `.agents/skills/`?
+- Should GitHub installs use archive downloads, sparse Git checkouts, or the GitHub Contents API for private repositories?
 
 ## Success Criteria
 
