@@ -80,14 +80,112 @@ fn main() -> Result<()> {
             println!("packed skill: {}", archive.display());
         }
         Command::Install { source, target } => {
-            println!(
-                "install skill: {} into {}",
-                source.display(),
-                target.display()
-            );
+            let installed = install_skill(&source, &target)?;
+            println!("installed skill: {}", installed.display());
         }
         Command::List { target } => {
-            println!("list skills in {}", target.display());
+            list_skills(&target)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn install_skill(source: &PathBuf, target: &PathBuf) -> Result<PathBuf> {
+    fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
+
+    if source.is_dir() {
+        let skill = read_skill(source)?;
+        validate_skill(&skill)?;
+        let destination = target.join(&skill.name);
+        if destination.exists() {
+            bail!("skill already installed: {}", destination.display());
+        }
+        copy_dir(source, &destination)?;
+        return Ok(destination);
+    }
+
+    if source.is_file() {
+        let file =
+            File::open(source).with_context(|| format!("failed to open {}", source.display()))?;
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        let unpacked_root = archive_root(source)?;
+        let destination = target.join(&unpacked_root);
+        if destination.exists() {
+            bail!("skill already installed: {}", destination.display());
+        }
+        archive
+            .unpack(target)
+            .with_context(|| format!("failed to unpack {}", source.display()))?;
+        let skill = read_skill(&destination)?;
+        validate_skill(&skill)?;
+        return Ok(destination);
+    }
+
+    bail!("install source does not exist: {}", source.display());
+}
+
+fn list_skills(target: &PathBuf) -> Result<()> {
+    if !target.exists() {
+        return Ok(());
+    }
+
+    let mut skills = Vec::new();
+    for entry in
+        fs::read_dir(target).with_context(|| format!("failed to read {}", target.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() && path.join("SKILL.md").is_file() {
+            let skill = read_skill(&path)?;
+            validate_skill(&skill)?;
+            skills.push(skill.name);
+        }
+    }
+
+    skills.sort();
+    for skill in skills {
+        println!("{skill}");
+    }
+
+    Ok(())
+}
+
+fn archive_root(source: &Path) -> Result<String> {
+    let filename = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("archive path has no valid file name"))?;
+    let root = filename
+        .strip_suffix(".skill.tar.gz")
+        .ok_or_else(|| anyhow!("archive must end with .skill.tar.gz"))?;
+    validate_skill_name(root)?;
+    Ok(root.to_string())
+}
+
+fn copy_dir(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+
+    for entry in
+        fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            copy_dir(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
         }
     }
 
