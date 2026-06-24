@@ -18,6 +18,24 @@ Create a skill:
 cargo run -p skillhub-cli -- new rust-code-review
 ```
 
+Initialize a project manifest:
+
+```bash
+cargo run -p skillhub-cli -- init
+```
+
+Add and install a skill source into the manifest target:
+
+```bash
+cargo run -p skillhub-cli -- add gh:anthropics/skills/skills/pdf
+```
+
+Sync all skills declared in `skillhub.toml`:
+
+```bash
+cargo run -p skillhub-cli -- sync
+```
+
 Validate a skill:
 
 ```bash
@@ -65,12 +83,14 @@ Implemented:
 - Deterministic `.skill.tar.gz` packaging.
 - Local installation from directories and package archives.
 - GitHub installation with `gh:owner/repo[@ref]/path/to/skill`.
+- Project manifests with `skillhub.toml`.
+- `add` and `sync` workflows for reproducible project installs.
 - Listing installed skills.
 
 Not implemented yet:
 
 - Static registries.
-- Project manifests and lockfiles.
+- Lockfiles.
 - Registry server behavior.
 - Publishing.
 - Signing, provenance, and policy checks.
