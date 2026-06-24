@@ -30,6 +30,8 @@ Add and install a skill source into the manifest target:
 cargo run -p skillhub-cli -- add gh:anthropics/skills/skills/pdf
 ```
 
+This updates `skillhub.toml` and writes `skillhub.lock` with the resolved source and a deterministic checksum of the installed skill contents.
+
 Sync all skills declared in `skillhub.toml`:
 
 ```bash
@@ -84,13 +86,14 @@ Implemented:
 - Local installation from directories and package archives.
 - GitHub installation with `gh:owner/repo[@ref]/path/to/skill`.
 - Project manifests with `skillhub.toml`.
+- Lockfiles with `skillhub.lock`.
 - `add` and `sync` workflows for reproducible project installs.
 - Listing installed skills.
 
 Not implemented yet:
 
 - Static registries.
-- Lockfiles.
+- Locking GitHub branches and tags to immutable commit SHAs.
 - Registry server behavior.
 - Publishing.
 - Signing, provenance, and policy checks.
