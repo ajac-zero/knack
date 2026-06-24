@@ -1,8 +1,13 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs::{self, File},
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
+use flate2::{Compression, write::GzEncoder};
 use serde::Deserialize;
+use tar::{Builder, Header};
 
 #[derive(Debug, Parser)]
 #[command(name = "skillhub")]
@@ -71,7 +76,8 @@ fn main() -> Result<()> {
             println!("valid skill: {}", skill.name);
         }
         Command::Pack { path, output } => {
-            println!("pack skill: {} into {}", path.display(), output.display());
+            let archive = pack_skill(&path, &output)?;
+            println!("packed skill: {}", archive.display());
         }
         Command::Install { source, target } => {
             println!(
@@ -85,6 +91,82 @@ fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn pack_skill(path: &PathBuf, output: &PathBuf) -> Result<PathBuf> {
+    let skill = read_skill(path)?;
+    validate_skill(&skill)?;
+
+    fs::create_dir_all(output).with_context(|| format!("failed to create {}", output.display()))?;
+    let archive_path = output.join(format!("{}.skill.tar.gz", skill.name));
+    let archive_file = File::create(&archive_path)
+        .with_context(|| format!("failed to create {}", archive_path.display()))?;
+    let encoder = GzEncoder::new(archive_file, Compression::default());
+    let mut archive = Builder::new(encoder);
+
+    let files = collect_files(path)?;
+    for file in files {
+        let relative_path = file.strip_prefix(path).with_context(|| {
+            format!(
+                "failed to make {} relative to {}",
+                file.display(),
+                path.display()
+            )
+        })?;
+        let archive_name = Path::new(&skill.name).join(relative_path);
+        append_file(&mut archive, &file, &archive_name)?;
+    }
+
+    archive.finish()?;
+    Ok(archive_path)
+}
+
+fn collect_files(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_files_inner(path, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_files_inner(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            collect_files_inner(&path, files)?;
+        } else if file_type.is_file() {
+            files.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn append_file(
+    archive: &mut Builder<GzEncoder<File>>,
+    source: &Path,
+    archive_name: &Path,
+) -> Result<()> {
+    let mut file =
+        File::open(source).with_context(|| format!("failed to open {}", source.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat {}", source.display()))?;
+
+    let mut header = Header::new_gnu();
+    header.set_size(metadata.len());
+    header.set_mode(0o644);
+    header.set_mtime(0);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_cksum();
+
+    archive
+        .append_data(&mut header, archive_name, &mut file)
+        .with_context(|| format!("failed to archive {}", source.display()))?;
     Ok(())
 }
 
