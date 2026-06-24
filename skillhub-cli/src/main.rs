@@ -1,5 +1,6 @@
 use std::{
     fs::{self, File},
+    io::Cursor,
     path::{Path, PathBuf},
 };
 
@@ -8,6 +9,7 @@ use clap::{Parser, Subcommand};
 use flate2::{Compression, write::GzEncoder};
 use serde::Deserialize;
 use tar::{Builder, Header};
+use tempfile::TempDir;
 
 #[derive(Debug, Parser)]
 #[command(name = "skillhub")]
@@ -47,8 +49,8 @@ enum Command {
 
     /// Install a skill from a local directory or packaged archive.
     Install {
-        /// Path to a skill directory or package archive.
-        source: PathBuf,
+        /// Path to a skill directory/package archive, or gh:owner/repo[@ref]/path/to/skill.
+        source: String,
 
         /// Directory where skills should be installed.
         #[arg(long, default_value = ".agents/skills")]
@@ -91,18 +93,22 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn install_skill(source: &PathBuf, target: &PathBuf) -> Result<PathBuf> {
+fn install_skill(source: &str, target: &PathBuf) -> Result<PathBuf> {
     fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
 
+    if let Some(spec) = source.strip_prefix("gh:") {
+        let fetched = fetch_github_skill(spec)?;
+        return install_skill_dir(&fetched.path, target);
+    }
+
+    let source = PathBuf::from(source);
+
+    install_local_skill(&source, target)
+}
+
+fn install_local_skill(source: &PathBuf, target: &PathBuf) -> Result<PathBuf> {
     if source.is_dir() {
-        let skill = read_skill(source)?;
-        validate_skill(&skill)?;
-        let destination = target.join(&skill.name);
-        if destination.exists() {
-            bail!("skill already installed: {}", destination.display());
-        }
-        copy_dir(source, &destination)?;
-        return Ok(destination);
+        return install_skill_dir(source, target);
     }
 
     if source.is_file() {
@@ -124,6 +130,125 @@ fn install_skill(source: &PathBuf, target: &PathBuf) -> Result<PathBuf> {
     }
 
     bail!("install source does not exist: {}", source.display());
+}
+
+#[derive(Debug)]
+struct GithubSpec {
+    owner: String,
+    repo: String,
+    reference: String,
+    skill_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct FetchedSkill {
+    path: PathBuf,
+    _temp_dir: TempDir,
+}
+
+fn fetch_github_skill(spec: &str) -> Result<FetchedSkill> {
+    let spec = parse_github_spec(spec)?;
+    let archive_url = format!(
+        "https://github.com/{}/{}/archive/{}.tar.gz",
+        spec.owner, spec.repo, spec.reference
+    );
+
+    let response = reqwest::blocking::Client::new()
+        .get(&archive_url)
+        .header(reqwest::header::USER_AGENT, "skillhub")
+        .send()
+        .with_context(|| format!("failed to fetch {archive_url}"))?
+        .error_for_status()
+        .with_context(|| format!("GitHub returned an error for {archive_url}"))?;
+
+    let bytes = response
+        .bytes()
+        .with_context(|| format!("failed to read {archive_url}"))?;
+    let temp_dir = tempfile::tempdir().context("failed to create temporary directory")?;
+    let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .unpack(temp_dir.path())
+        .context("failed to unpack GitHub archive")?;
+
+    let repo_root = single_child_dir(temp_dir.path())?;
+    let skill_dir = repo_root.join(&spec.skill_path);
+    let skill = read_skill(&skill_dir).with_context(|| {
+        format!(
+            "GitHub source did not resolve to a valid skill directory: {}",
+            skill_dir.display()
+        )
+    })?;
+    validate_skill(&skill)?;
+
+    Ok(FetchedSkill {
+        path: skill_dir,
+        _temp_dir: temp_dir,
+    })
+}
+
+fn parse_github_spec(spec: &str) -> Result<GithubSpec> {
+    let mut parts = spec.splitn(3, '/');
+    let owner = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| anyhow!("GitHub source must be gh:owner/repo[@ref]/path/to/skill"))?;
+    let repo_with_ref = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| anyhow!("GitHub source must include a repository"))?;
+    let skill_path = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| anyhow!("GitHub source must include a skill path"))?;
+
+    let (repo, reference) = repo_with_ref
+        .split_once('@')
+        .map(|(repo, reference)| (repo, reference))
+        .unwrap_or((repo_with_ref, "main"));
+
+    if repo.is_empty() || reference.is_empty() {
+        bail!("GitHub source repository and ref must not be empty");
+    }
+
+    Ok(GithubSpec {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        reference: reference.to_string(),
+        skill_path: PathBuf::from(skill_path),
+    })
+}
+
+fn single_child_dir(path: &Path) -> Result<PathBuf> {
+    let mut children = fs::read_dir(path)
+        .with_context(|| format!("failed to read {}", path.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.path());
+
+    let child = children
+        .next()
+        .ok_or_else(|| anyhow!("GitHub archive did not contain a repository directory"))?;
+    if children.next().is_some() {
+        bail!("GitHub archive contained multiple repository directories");
+    }
+    Ok(child)
+}
+
+fn install_skill_dir(source: &Path, target: &Path) -> Result<PathBuf> {
+    let skill = read_skill(source)?;
+    validate_skill(&skill)?;
+    let destination = target.join(&skill.name);
+    if destination.exists() {
+        bail!("skill already installed: {}", destination.display());
+    }
+    copy_dir(source, &destination)?;
+    Ok(destination)
 }
 
 fn list_skills(target: &PathBuf) -> Result<()> {
@@ -314,7 +439,7 @@ fn new_skill(name: &str, dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn read_skill(path: &PathBuf) -> Result<Skill> {
+fn read_skill(path: &Path) -> Result<Skill> {
     if !path.is_dir() {
         bail!("skill path is not a directory: {}", path.display());
     }
@@ -326,7 +451,7 @@ fn read_skill(path: &PathBuf) -> Result<Skill> {
         .with_context(|| format!("failed to parse {}", skill_file.display()))?;
 
     Ok(Skill {
-        path: path.clone(),
+        path: path.to_path_buf(),
         name: frontmatter.name,
         description: frontmatter.description,
     })
