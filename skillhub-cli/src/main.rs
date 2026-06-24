@@ -270,6 +270,8 @@ fn add_skill(manifest_path: &Path, source: &str) -> Result<()> {
 
 fn sync_skills(manifest_path: &Path) -> Result<()> {
     let manifest = read_manifest(manifest_path)?;
+    let lockfile_path = lockfile_path_for(manifest_path);
+    let mut lockfile = read_lockfile(&lockfile_path)?;
     fs::create_dir_all(&manifest.install.target)
         .with_context(|| format!("failed to create {}", manifest.install.target.display()))?;
 
@@ -279,10 +281,26 @@ fn sync_skills(manifest_path: &Path) -> Result<()> {
             continue;
         }
 
-        let installed = install_skill(source, &manifest.install.target)?;
+        let resolved = lockfile
+            .skill
+            .iter()
+            .find(|skill| skill.name == *name && skill.source == *source)
+            .map(|skill| skill.resolved.clone())
+            .unwrap_or_else(|| source.clone());
+        let installed = install_skill(&resolved, &manifest.install.target)?;
+        upsert_lock(
+            &mut lockfile,
+            LockedSkill {
+                name: installed.name.clone(),
+                source: source.clone(),
+                resolved,
+                checksum: checksum_dir(&installed.path)?,
+            },
+        );
         println!("synced skill: {}", installed.name);
     }
 
+    write_lockfile(&lockfile_path, &lockfile)?;
     Ok(())
 }
 
