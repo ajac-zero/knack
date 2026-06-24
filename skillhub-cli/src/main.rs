@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use flate2::{Compression, write::GzEncoder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tar::{Builder, Header};
 use tempfile::TempDir;
 
@@ -21,6 +21,17 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create a skillhub.toml manifest in the current project.
+    Init {
+        /// Path where the manifest should be written.
+        #[arg(long, default_value = "skillhub.toml")]
+        manifest: PathBuf,
+
+        /// Directory where project skills should be installed.
+        #[arg(long, default_value = ".agents/skills")]
+        target: PathBuf,
+    },
+
     /// Create a new skill directory.
     New {
         /// Skill name. Must be lowercase letters, numbers, and hyphens.
@@ -69,6 +80,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Init { manifest, target } => {
+            init_manifest(&manifest, &target)?;
+        }
         Command::New { name, dir } => {
             new_skill(&name, dir)?;
         }
@@ -91,6 +105,51 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Manifest {
+    install: InstallConfig,
+    #[serde(default)]
+    skills: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct InstallConfig {
+    target: PathBuf,
+}
+
+impl Manifest {
+    fn new(target: PathBuf) -> Self {
+        Self {
+            install: InstallConfig { target },
+            skills: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+fn init_manifest(manifest_path: &Path, target: &Path) -> Result<()> {
+    if manifest_path.exists() {
+        bail!("manifest already exists: {}", manifest_path.display());
+    }
+
+    let manifest = Manifest::new(target.to_path_buf());
+    write_manifest(manifest_path, &manifest)?;
+    println!("created manifest: {}", manifest_path.display());
+    Ok(())
+}
+
+fn read_manifest(manifest_path: &Path) -> Result<Manifest> {
+    let contents = fs::read_to_string(manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    toml::from_str(&contents)
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))
+}
+
+fn write_manifest(manifest_path: &Path, manifest: &Manifest) -> Result<()> {
+    let contents = toml::to_string_pretty(manifest).context("failed to serialize manifest")?;
+    fs::write(manifest_path, contents)
+        .with_context(|| format!("failed to write {}", manifest_path.display()))
 }
 
 fn install_skill(source: &str, target: &PathBuf) -> Result<PathBuf> {
