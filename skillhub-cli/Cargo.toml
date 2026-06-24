@@ -1,0 +1,10 @@
+[package]
+name = "skillhub-cli"
+version = "0.0.0"
+edition = "2024"
+
+[[bin]]
+name = "skillhub"
+path = "src/main.rs"
+
+[dependencies]
