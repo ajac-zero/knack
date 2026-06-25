@@ -63,6 +63,12 @@ enum Command {
         scope: Scope,
     },
 
+    /// Manage registry aliases.
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCommand,
+    },
+
     /// Create a new skill directory.
     New {
         /// Skill name. Must be lowercase letters, numbers, and hyphens.
@@ -113,6 +119,65 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Scope::Project)]
         scope: Scope,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum RegistryCommand {
+    /// Add or update a registry alias.
+    Add {
+        /// Alias name, e.g. tea.
+        name: String,
+
+        /// Base URL, e.g. git+ssh://git@gitea.example.com.
+        url: String,
+
+        /// Registry backend type.
+        #[arg(long, value_enum, default_value_t = RegistryKind::GitHost)]
+        kind: RegistryKind,
+
+        /// Default Git ref for git-host registries.
+        #[arg(long, default_value = "main")]
+        default_ref: String,
+
+        /// Path to the project manifest.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Configuration scope to use when --manifest is not provided.
+        #[arg(long, value_enum, default_value_t = Scope::Project)]
+        scope: Scope,
+    },
+
+    /// List registry aliases.
+    List {
+        /// Path to the project manifest.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Configuration scope to use when --manifest is not provided.
+        #[arg(long, value_enum, default_value_t = Scope::Project)]
+        scope: Scope,
+    },
+
+    /// Remove a registry alias.
+    Remove {
+        /// Alias name to remove.
+        name: String,
+
+        /// Path to the project manifest.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Configuration scope to use when --manifest is not provided.
+        #[arg(long, value_enum, default_value_t = Scope::Project)]
+        scope: Scope,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum RegistryKind {
+    GitHost,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -188,6 +253,9 @@ fn main() -> Result<()> {
             let manifest = resolve_manifest_path(manifest, scope)?;
             sync_skills(&manifest)?;
         }
+        Command::Registry { command } => {
+            handle_registry_command(command)?;
+        }
         Command::New { name, dir } => {
             new_skill(&name, dir)?;
         }
@@ -223,6 +291,15 @@ struct Manifest {
     install: InstallConfig,
     #[serde(default)]
     skills: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    registries: std::collections::BTreeMap<String, RegistryConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RegistryConfig {
+    kind: RegistryKind,
+    url: String,
+    default_ref: String,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -249,8 +326,78 @@ impl Manifest {
         Self {
             install: InstallConfig { target },
             skills: std::collections::BTreeMap::new(),
+            registries: std::collections::BTreeMap::new(),
         }
     }
+}
+
+fn handle_registry_command(command: RegistryCommand) -> Result<()> {
+    match command {
+        RegistryCommand::Add {
+            name,
+            url,
+            kind,
+            default_ref,
+            manifest,
+            scope,
+        } => {
+            let manifest_path = resolve_manifest_path(manifest, scope)?;
+            registry_add(
+                &manifest_path,
+                &name,
+                RegistryConfig {
+                    kind,
+                    url,
+                    default_ref,
+                },
+            )?;
+        }
+        RegistryCommand::List { manifest, scope } => {
+            let manifest_path = resolve_manifest_path(manifest, scope)?;
+            registry_list(&manifest_path)?;
+        }
+        RegistryCommand::Remove {
+            name,
+            manifest,
+            scope,
+        } => {
+            let manifest_path = resolve_manifest_path(manifest, scope)?;
+            registry_remove(&manifest_path, &name)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn registry_add(manifest_path: &Path, name: &str, config: RegistryConfig) -> Result<()> {
+    validate_registry_name(name)?;
+    let mut manifest = read_manifest(manifest_path)?;
+    manifest.registries.insert(name.to_string(), config);
+    write_manifest(manifest_path, &manifest)?;
+    println!("registered registry: {name}");
+    Ok(())
+}
+
+fn registry_list(manifest_path: &Path) -> Result<()> {
+    let manifest = read_manifest(manifest_path)?;
+    for (name, registry) in manifest.registries {
+        println!("{}\t{:?}\t{}", name, registry.kind, registry.url);
+    }
+    Ok(())
+}
+
+fn registry_remove(manifest_path: &Path, name: &str) -> Result<()> {
+    let mut manifest = read_manifest(manifest_path)?;
+    if manifest.registries.remove(name).is_none() {
+        bail!("registry not found: {name}");
+    }
+    write_manifest(manifest_path, &manifest)?;
+    println!("removed registry: {name}");
+    Ok(())
+}
+
+fn validate_registry_name(name: &str) -> Result<()> {
+    validate_skill_name(name).context("registry aliases use the same naming rules as skills")
 }
 
 fn init_manifest(manifest_path: &Path, target: &Path) -> Result<()> {
