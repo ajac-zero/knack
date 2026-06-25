@@ -147,6 +147,33 @@ Alias syntax is:
 alias:owner/repo[@ref]/path/to/skill
 ```
 
+Generate a searchable registry index from a local tree of skills:
+
+```bash
+cargo run -p skillhub-cli -- index generate ./skills \
+  --source-prefix gh:owner/repo/skills \
+  --output skillhub.index.toml
+```
+
+Serve the index with `skillhub-registry`:
+
+```bash
+cargo run -p skillhub-registry -- --index skillhub.index.toml --bind 127.0.0.1:7349
+```
+
+Register and search that registry from the CLI:
+
+```bash
+cargo run -p skillhub-cli -- registry add local http://127.0.0.1:7349 --kind http
+cargo run -p skillhub-cli -- find pdf
+```
+
+Search results are installable sources:
+
+```text
+local	pdf	Work with PDF files...	gh:owner/repo/skills/pdf
+```
+
 List installed skills:
 
 ```bash
@@ -164,6 +191,8 @@ Implemented:
 - GitHub installation with `gh:owner/repo[@ref]/path/to/skill`.
 - Generic Git installation with `git+<url>[@ref]//path/to/skill`.
 - Git-host registry aliases with `alias:owner/repo[@ref]/path/to/skill`.
+- Searchable HTTP registries served by `skillhub-registry`.
+- Registry index generation from local skill directories.
 - Project manifests with `skillhub.toml`.
 - Lockfiles with `skillhub.lock`.
 - Project and global scoped config/install paths.
