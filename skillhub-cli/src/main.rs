@@ -80,6 +80,36 @@ enum Command {
         scope: Scope,
     },
 
+    /// Publish a skill to a git-backed skill repository.
+    Publish {
+        /// Path to the skill directory to publish.
+        path: PathBuf,
+
+        /// Git-host registry alias to publish through.
+        #[arg(long)]
+        registry: String,
+
+        /// Repository in owner/repo form under the registry host.
+        #[arg(long)]
+        repo: String,
+
+        /// Directory inside the repository where skills live.
+        #[arg(long, default_value = "skills")]
+        skills_dir: PathBuf,
+
+        /// Path to the project manifest.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Configuration scope to use when --manifest is not provided.
+        #[arg(long, value_enum, default_value_t = Scope::Project)]
+        scope: Scope,
+
+        /// Do not push the generated commit.
+        #[arg(long)]
+        no_push: bool,
+    },
+
     /// Manage registry aliases.
     Registry {
         #[command(subcommand)]
@@ -313,6 +343,18 @@ fn main() -> Result<()> {
             let manifest = resolve_manifest_path(manifest, scope)?;
             find_registry_skills(&manifest, &query)?;
         }
+        Command::Publish {
+            path,
+            registry,
+            repo,
+            skills_dir,
+            manifest,
+            scope,
+            no_push,
+        } => {
+            let manifest = resolve_manifest_path(manifest, scope)?;
+            publish_skill(&manifest, &path, &registry, &repo, &skills_dir, no_push)?;
+        }
         Command::Registry { command } => {
             handle_registry_command(command)?;
         }
@@ -526,6 +568,110 @@ fn find_registry_skills(manifest_path: &Path, query: &str) -> Result<()> {
         println!("no matching skills found");
     }
 
+    Ok(())
+}
+
+fn publish_skill(
+    manifest_path: &Path,
+    skill_path: &Path,
+    registry_name: &str,
+    repo: &str,
+    skills_dir: &Path,
+    no_push: bool,
+) -> Result<()> {
+    let skill = read_skill(skill_path)?;
+    validate_skill(&skill)?;
+
+    let manifest = read_manifest(manifest_path)?;
+    let registries = effective_registries(&manifest)?;
+    let registry = registries
+        .get(registry_name)
+        .ok_or_else(|| anyhow!("registry not found: {registry_name}"))?;
+    if !matches!(registry.kind, RegistryKind::GitHost) {
+        bail!("publish currently supports only git-host registries");
+    }
+
+    let repo_url = git_host_repo_url(&registry.url, repo)?;
+    let temp_dir = tempfile::tempdir().context("failed to create temporary directory")?;
+    let checkout = temp_dir.path().join("repo");
+    run_git(
+        ["clone", &repo_url, checkout.to_str().unwrap_or_default()],
+        None,
+        "clone publish repository",
+    )?;
+
+    let destination = checkout.join(skills_dir).join(&skill.name);
+    if destination.exists() {
+        fs::remove_dir_all(&destination)
+            .with_context(|| format!("failed to replace {}", destination.display()))?;
+    }
+    copy_dir(skill_path, &destination)?;
+
+    let source_prefix = format!(
+        "{}:{}/{}",
+        registry_name,
+        repo.trim_matches('/'),
+        skills_dir.to_string_lossy().replace('\\', "/")
+    );
+    generate_index(
+        &checkout.join(skills_dir),
+        &source_prefix,
+        &checkout.join("skillhub.index.toml"),
+    )?;
+
+    run_git(["add", "."], Some(&checkout), "stage published skill")?;
+    let status_output = ProcessCommand::new("git")
+        .arg("status")
+        .arg("--porcelain")
+        .current_dir(&checkout)
+        .output()
+        .context("failed to inspect publish repository status")?;
+    if status_output.stdout.is_empty() {
+        println!("nothing to publish: {}", skill.name);
+        return Ok(());
+    }
+
+    let message = format!("Publish skill {}", skill.name);
+    run_git(
+        ["commit", "-m", &message],
+        Some(&checkout),
+        "commit published skill",
+    )?;
+    if !no_push {
+        run_git(["push"], Some(&checkout), "push published skill")?;
+    }
+
+    println!("published skill: {}", skill.name);
+    Ok(())
+}
+
+fn git_host_repo_url(base_url: &str, repo: &str) -> Result<String> {
+    let repo = repo.trim_matches('/');
+    if repo.split('/').count() != 2 {
+        bail!("--repo must be in owner/repo form");
+    }
+
+    let base_url = base_url.trim_end_matches('/');
+    let base_url = base_url.strip_prefix("git+").unwrap_or(base_url);
+    Ok(format!("{base_url}/{repo}.git"))
+}
+
+fn run_git<'a>(
+    args: impl IntoIterator<Item = &'a str>,
+    cwd: Option<&Path>,
+    action: &str,
+) -> Result<()> {
+    let mut command = ProcessCommand::new("git");
+    command.args(args);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("failed to run git for {action}; is git installed?"))?;
+    if !status.success() {
+        bail!("git failed to {action}");
+    }
     Ok(())
 }
 
