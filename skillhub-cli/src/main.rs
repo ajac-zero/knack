@@ -180,12 +180,14 @@ enum RegistryCommand {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum RegistryKindArg {
     GitHost,
+    Http,
 }
 
 impl From<RegistryKindArg> for RegistryKind {
     fn from(kind: RegistryKindArg) -> Self {
         match kind {
             RegistryKindArg::GitHost => Self::GitHost,
+            RegistryKindArg::Http => Self::Http,
         }
     }
 }
@@ -520,6 +522,7 @@ fn resolve_source_alias(source: &str, manifest: &Manifest) -> Result<String> {
 
     match registry.kind {
         RegistryKind::GitHost => resolve_git_host_alias(registry, rest),
+        RegistryKind::Http => Ok(source.to_string()),
     }
 }
 

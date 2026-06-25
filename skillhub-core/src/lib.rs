@@ -210,6 +210,66 @@ pub struct RegistryConfig {
 #[serde(rename_all = "kebab-case")]
 pub enum RegistryKind {
     GitHost,
+    Http,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RegistryIndex {
+    #[serde(default)]
+    pub skill: Vec<IndexedSkill>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IndexedSkill {
+    pub name: String,
+    pub description: String,
+    pub source: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+impl RegistryIndex {
+    pub fn validate(&self) -> Result<()> {
+        for skill in &self.skill {
+            skill.validate()?;
+        }
+        Ok(())
+    }
+
+    pub fn search(&self, query: &str) -> Vec<&IndexedSkill> {
+        let terms: Vec<String> = query
+            .split_whitespace()
+            .map(|term| term.to_ascii_lowercase())
+            .collect();
+        if terms.is_empty() {
+            return Vec::new();
+        }
+
+        self.skill
+            .iter()
+            .filter(|skill| {
+                let haystack = skill.search_text();
+                terms.iter().all(|term| haystack.contains(term))
+            })
+            .collect()
+    }
+}
+
+impl IndexedSkill {
+    pub fn validate(&self) -> Result<()> {
+        validate_skill_name(&self.name)?;
+        if self.description.trim().is_empty() {
+            bail!("indexed skill description must not be empty: {}", self.name);
+        }
+        if self.source.trim().is_empty() {
+            bail!("indexed skill source must not be empty: {}", self.name);
+        }
+        Ok(())
+    }
+
+    fn search_text(&self) -> String {
+        format!("{} {} {}", self.name, self.description, self.tags.join(" ")).to_ascii_lowercase()
+    }
 }
 
 #[cfg(test)]
@@ -238,5 +298,29 @@ mod tests {
     #[test]
     fn rejects_missing_frontmatter() {
         assert!(parse_frontmatter("# demo\n").is_err());
+    }
+
+    #[test]
+    fn searches_registry_index() {
+        let index = RegistryIndex {
+            skill: vec![
+                IndexedSkill {
+                    name: "pdf".to_string(),
+                    description: "Work with PDF documents".to_string(),
+                    source: "gh:anthropics/skills/skills/pdf".to_string(),
+                    tags: vec!["documents".to_string(), "ocr".to_string()],
+                },
+                IndexedSkill {
+                    name: "rust-code-review".to_string(),
+                    description: "Review Rust code".to_string(),
+                    source: "tea:platform/skills/rust-code-review".to_string(),
+                    tags: vec!["rust".to_string()],
+                },
+            ],
+        };
+
+        assert_eq!(index.search("pdf").len(), 1);
+        assert_eq!(index.search("documents ocr").len(), 1);
+        assert_eq!(index.search("python").len(), 0);
     }
 }
