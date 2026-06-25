@@ -161,6 +161,18 @@ Serve the index with `skillhub-registry`:
 cargo run -p skillhub-registry -- --index skillhub.index.toml --bind 127.0.0.1:7349
 ```
 
+To make the HTTP registry the only thing users need to interact with, serve skill archives too:
+
+```bash
+cargo run -p skillhub-registry -- \
+  --index skillhub.index.toml \
+  --skills-root ./skills \
+  --public-alias company \
+  --bind 127.0.0.1:7349
+```
+
+With `--public-alias company`, search results return proxy install sources such as `company:deploy-container`. The CLI resolves those through the HTTP registry and downloads the skill archive from the registry server.
+
 Register and search that registry from the CLI:
 
 ```bash
@@ -172,6 +184,18 @@ Search results are installable sources:
 
 ```text
 local	pdf	Work with PDF files...	gh:owner/repo/skills/pdf
+```
+
+In proxy mode, results look like this:
+
+```text
+company	deploy-container	Deploy containers to Kubernetes. 	company:deploy-container
+```
+
+Users can install without knowing the backing Git repo:
+
+```bash
+cargo run -p skillhub-cli -- add company:deploy-container
 ```
 
 Publish a local skill into a git-backed team skills repository:
@@ -210,6 +234,7 @@ Implemented:
 - Generic Git installation with `git+<url>[@ref]//path/to/skill`.
 - Git-host registry aliases with `alias:owner/repo[@ref]/path/to/skill`.
 - Searchable HTTP registries served by `skillhub-registry`.
+- Proxied HTTP registry installs with `registry:skill-name`.
 - Registry index generation from local skill directories.
 - Publishing skills to git-backed team repositories.
 - Project manifests with `skillhub.toml`.
