@@ -211,3 +211,32 @@ pub struct RegistryConfig {
 pub enum RegistryKind {
     GitHost,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_skill_names() {
+        assert!(validate_skill_name("rust-code-review").is_ok());
+        assert!(validate_skill_name("Rust-Code-Review").is_err());
+        assert!(validate_skill_name("-rust").is_err());
+        assert!(validate_skill_name("rust-").is_err());
+        assert!(validate_skill_name("rust--review").is_err());
+    }
+
+    #[test]
+    fn parses_frontmatter() {
+        let frontmatter =
+            parse_frontmatter("---\nname: demo-skill\ndescription: Use for demos.\n---\n\nBody\n")
+                .expect("frontmatter should parse");
+
+        assert_eq!(frontmatter.name, "demo-skill");
+        assert_eq!(frontmatter.description, "Use for demos.");
+    }
+
+    #[test]
+    fn rejects_missing_frontmatter() {
+        assert!(parse_frontmatter("# demo\n").is_err());
+    }
+}
