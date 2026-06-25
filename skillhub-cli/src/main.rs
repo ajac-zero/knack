@@ -843,8 +843,17 @@ fn resolve_source_alias(source: &str, manifest: &Manifest) -> Result<String> {
 
     match registry.kind {
         RegistryKind::GitHost => resolve_git_host_alias(registry, rest),
-        RegistryKind::Http => Ok(source.to_string()),
+        RegistryKind::Http => resolve_http_alias(registry, rest),
     }
+}
+
+fn resolve_http_alias(registry: &RegistryConfig, rest: &str) -> Result<String> {
+    validate_skill_name(rest)?;
+    Ok(format!(
+        "http+skillhub:{}/skills/{}/archive",
+        registry.url.trim_end_matches('/'),
+        rest
+    ))
 }
 
 fn effective_registries(
@@ -915,9 +924,36 @@ fn install_skill(source: &str, target: &PathBuf) -> Result<InstalledSkill> {
         return install_skill_dir(&fetched.path, target);
     }
 
+    if let Some(url) = source.strip_prefix("http+skillhub:") {
+        return install_http_skill_archive(url, target);
+    }
+
     let source = PathBuf::from(source);
 
     install_local_skill(&source, target)
+}
+
+fn install_http_skill_archive(url: &str, target: &Path) -> Result<InstalledSkill> {
+    fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
+    let response = reqwest::blocking::Client::new()
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "skillhub")
+        .send()
+        .with_context(|| format!("failed to download {url}"))?
+        .error_for_status()
+        .with_context(|| format!("registry returned an error for {url}"))?;
+    let bytes = response.bytes().context("failed to read skill archive")?;
+    install_archive_reader(flate2::read::GzDecoder::new(Cursor::new(bytes)), target)
+}
+
+fn install_archive_reader<R: std::io::Read>(reader: R, target: &Path) -> Result<InstalledSkill> {
+    let mut archive = tar::Archive::new(reader);
+    let temp_dir = tempfile::tempdir().context("failed to create temporary directory")?;
+    archive
+        .unpack(temp_dir.path())
+        .context("failed to unpack skill archive")?;
+    let root = single_child_dir(temp_dir.path())?;
+    install_skill_dir(&root, target)
 }
 
 fn install_local_skill(source: &PathBuf, target: &PathBuf) -> Result<InstalledSkill> {
@@ -928,22 +964,7 @@ fn install_local_skill(source: &PathBuf, target: &PathBuf) -> Result<InstalledSk
     if source.is_file() {
         let file =
             File::open(source).with_context(|| format!("failed to open {}", source.display()))?;
-        let decoder = flate2::read::GzDecoder::new(file);
-        let mut archive = tar::Archive::new(decoder);
-        let unpacked_root = archive_root(source)?;
-        let destination = target.join(&unpacked_root);
-        if destination.exists() {
-            bail!("skill already installed: {}", destination.display());
-        }
-        archive
-            .unpack(target)
-            .with_context(|| format!("failed to unpack {}", source.display()))?;
-        let skill = read_skill(&destination)?;
-        validate_skill(&skill)?;
-        return Ok(InstalledSkill {
-            name: skill.name,
-            path: destination,
-        });
+        return install_archive_reader(flate2::read::GzDecoder::new(file), target);
     }
 
     bail!("install source does not exist: {}", source.display());
@@ -1180,18 +1201,6 @@ fn list_skills(target: &PathBuf) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn archive_root(source: &Path) -> Result<String> {
-    let filename = source
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("archive path has no valid file name"))?;
-    let root = filename
-        .strip_suffix(".skill.tar.gz")
-        .ok_or_else(|| anyhow!("archive must end with .skill.tar.gz"))?;
-    validate_skill_name(root)?;
-    Ok(root.to_string())
 }
 
 fn copy_dir(source: &Path, destination: &Path) -> Result<()> {
