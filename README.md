@@ -49,6 +49,31 @@ Global scope uses:
 ~/.agents/skills/
 ```
 
+Admins can provide system-wide defaults with system scope:
+
+```bash
+cargo run -p skillhub-cli -- init --scope system
+cargo run -p skillhub-cli -- registry add tea git+ssh://git@gitea.example.com --scope system
+```
+
+System scope uses:
+
+```text
+/etc/skillhub/skillhub.toml
+/etc/skillhub/skillhub.lock
+/usr/local/share/skillhub/skills/
+```
+
+Registry aliases are inherited in this order, with later layers overriding earlier layers:
+
+```text
+system (/etc/skillhub/skillhub.toml)
+global (~/.config/skillhub/skillhub.toml)
+project (./skillhub.toml)
+```
+
+That lets administrators inject aliases such as `tea:` for all users while still allowing user or project-level overrides.
+
 Add and install a skill source into the manifest target:
 
 ```bash
@@ -142,6 +167,8 @@ Implemented:
 - Project manifests with `skillhub.toml`.
 - Lockfiles with `skillhub.lock`.
 - Project and global scoped config/install paths.
+- System scoped config at `/etc/skillhub/skillhub.toml`.
+- Layered registry alias inheritance from system to global to project.
 - `add` and `sync` workflows for reproducible project installs.
 - Listing installed skills.
 
