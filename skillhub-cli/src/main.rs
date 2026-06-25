@@ -185,6 +185,7 @@ enum RegistryKind {
 enum Scope {
     Project,
     Global,
+    System,
 }
 
 impl Scope {
@@ -192,6 +193,7 @@ impl Scope {
         match self {
             Self::Project => Ok(PathBuf::from("skillhub.toml")),
             Self::Global => Ok(config_dir()?.join("skillhub.toml")),
+            Self::System => Ok(PathBuf::from("/etc/skillhub/skillhub.toml")),
         }
     }
 
@@ -199,6 +201,7 @@ impl Scope {
         match self {
             Self::Project => Ok(PathBuf::from(".agents/skills")),
             Self::Global => Ok(home_dir()?.join(".agents/skills")),
+            Self::System => Ok(PathBuf::from("/usr/local/share/skillhub/skills")),
         }
     }
 }
