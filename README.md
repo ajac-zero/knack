@@ -174,6 +174,24 @@ Search results are installable sources:
 local	pdf	Work with PDF files...	gh:owner/repo/skills/pdf
 ```
 
+Publish a local skill into a git-backed team skills repository:
+
+```bash
+cargo run -p skillhub-cli -- registry add tea git+ssh://git@gitea.example.com
+cargo run -p skillhub-cli -- publish ./my-skill \
+  --registry tea \
+  --repo platform/agent-skills
+```
+
+Publishing currently supports `git-host` registries. It clones the target repository, copies the skill into `skills/<skill-name>`, regenerates `skillhub.index.toml`, commits the change, and pushes it. Use `--no-push` to leave the commit local in the temporary checkout for debugging.
+
+After the registry server is serving the updated `skillhub.index.toml`, teammates can discover and install the skill:
+
+```bash
+cargo run -p skillhub-cli -- find my-skill
+cargo run -p skillhub-cli -- add tea:platform/agent-skills/skills/my-skill
+```
+
 List installed skills:
 
 ```bash
@@ -193,6 +211,7 @@ Implemented:
 - Git-host registry aliases with `alias:owner/repo[@ref]/path/to/skill`.
 - Searchable HTTP registries served by `skillhub-registry`.
 - Registry index generation from local skill directories.
+- Publishing skills to git-backed team repositories.
 - Project manifests with `skillhub.toml`.
 - Lockfiles with `skillhub.lock`.
 - Project and global scoped config/install paths.
@@ -205,6 +224,4 @@ Not implemented yet:
 
 - Static registries.
 - Locking GitHub branches and tags to immutable commit SHAs.
-- Registry server behavior.
-- Publishing.
 - Signing, provenance, and policy checks.
