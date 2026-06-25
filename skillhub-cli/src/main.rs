@@ -5,7 +5,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use directories::ProjectDirs;
 use flate2::{Compression, write::GzEncoder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -92,6 +93,40 @@ enum Command {
         #[arg(long, default_value = ".agents/skills")]
         target: PathBuf,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Scope {
+    Project,
+    Global,
+}
+
+impl Scope {
+    fn manifest_path(self) -> Result<PathBuf> {
+        match self {
+            Self::Project => Ok(PathBuf::from("skillhub.toml")),
+            Self::Global => Ok(config_dir()?.join("skillhub.toml")),
+        }
+    }
+
+    fn install_target(self) -> Result<PathBuf> {
+        match self {
+            Self::Project => Ok(PathBuf::from(".agents/skills")),
+            Self::Global => Ok(home_dir()?.join(".agents/skills")),
+        }
+    }
+}
+
+fn config_dir() -> Result<PathBuf> {
+    let dirs = ProjectDirs::from("io", "skillhub", "skillhub")
+        .ok_or_else(|| anyhow!("failed to resolve global config directory"))?;
+    Ok(dirs.config_dir().to_path_buf())
+}
+
+fn home_dir() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("HOME is not set; cannot resolve global skill directory"))
 }
 
 fn main() -> Result<()> {
