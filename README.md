@@ -95,6 +95,33 @@ For example:
 cargo run -p skillhub-cli -- install gh:anthropics/skills/skills/pdf --target .agents/skills
 ```
 
+Install from any Git host supported by your local `git` command:
+
+```bash
+cargo run -p skillhub-cli -- install git+https://git.example.com/org/skills.git//path/to/skill
+cargo run -p skillhub-cli -- install git+ssh://git@git.example.com/org/skills.git@main//path/to/skill
+```
+
+Register a Git host alias in `skillhub.toml`:
+
+```bash
+cargo run -p skillhub-cli -- registry add tea git+ssh://git@gitea.example.com
+cargo run -p skillhub-cli -- registry list
+```
+
+Then add skills through the alias:
+
+```bash
+cargo run -p skillhub-cli -- add tea:platform/agent-skills/rust-code-review
+cargo run -p skillhub-cli -- add tea:platform/agent-skills@v1.2.0/rust-code-review
+```
+
+Alias syntax is:
+
+```text
+alias:owner/repo[@ref]/path/to/skill
+```
+
 List installed skills:
 
 ```bash
@@ -110,6 +137,8 @@ Implemented:
 - Deterministic `.skill.tar.gz` packaging.
 - Local installation from directories and package archives.
 - GitHub installation with `gh:owner/repo[@ref]/path/to/skill`.
+- Generic Git installation with `git+<url>[@ref]//path/to/skill`.
+- Git-host registry aliases with `alias:owner/repo[@ref]/path/to/skill`.
 - Project manifests with `skillhub.toml`.
 - Lockfiles with `skillhub.lock`.
 - Project and global scoped config/install paths.
