@@ -10,8 +10,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use flate2::{Compression, write::GzEncoder};
 use skillhub_core::{
-    IndexedSkill, LockedSkill, Lockfile, Manifest, RegistryConfig, RegistryKind, checksum_dir,
-    collect_files, read_skill, validate_skill, validate_skill_name,
+    IndexedSkill, LockedSkill, Lockfile, Manifest, RegistryConfig, RegistryIndex, RegistryKind,
+    checksum_dir, collect_files, read_skill, validate_skill, validate_skill_name,
 };
 use tar::{Builder, Header};
 use tempfile::TempDir;
@@ -86,6 +86,12 @@ enum Command {
         command: RegistryCommand,
     },
 
+    /// Manage registry indexes.
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
+    },
+
     /// Create a new skill directory.
     New {
         /// Skill name. Must be lowercase letters, numbers, and hyphens.
@@ -135,6 +141,23 @@ enum Command {
         /// List target scope to use when --target is not provided.
         #[arg(long, value_enum, default_value_t = Scope::Project)]
         scope: Scope,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IndexCommand {
+    /// Generate a registry index from a local tree of skills.
+    Generate {
+        /// Root directory to scan for skill directories.
+        root: PathBuf,
+
+        /// Source prefix used to build installable sources for indexed skills.
+        #[arg(long)]
+        source_prefix: String,
+
+        /// Output index file.
+        #[arg(short, long, default_value = "skillhub.index.toml")]
+        output: PathBuf,
     },
 }
 
@@ -293,6 +316,9 @@ fn main() -> Result<()> {
         Command::Registry { command } => {
             handle_registry_command(command)?;
         }
+        Command::Index { command } => {
+            handle_index_command(command)?;
+        }
         Command::New { name, dir } => {
             new_skill(&name, dir)?;
         }
@@ -359,6 +385,84 @@ fn handle_registry_command(command: RegistryCommand) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn handle_index_command(command: IndexCommand) -> Result<()> {
+    match command {
+        IndexCommand::Generate {
+            root,
+            source_prefix,
+            output,
+        } => generate_index(&root, &source_prefix, &output)?,
+    }
+
+    Ok(())
+}
+
+fn generate_index(root: &Path, source_prefix: &str, output: &Path) -> Result<()> {
+    let mut index = RegistryIndex::default();
+    for skill_dir in collect_skill_dirs(root)? {
+        let skill = read_skill(&skill_dir)?;
+        validate_skill(&skill)?;
+        let relative = skill_dir.strip_prefix(root).with_context(|| {
+            format!(
+                "failed to make {} relative to {}",
+                skill_dir.display(),
+                root.display()
+            )
+        })?;
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        index.skill.push(IndexedSkill {
+            name: skill.name,
+            description: skill.description,
+            source: format!("{}/{}", source_prefix.trim_end_matches('/'), relative),
+            tags: Vec::new(),
+        });
+    }
+    index
+        .skill
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    index.validate()?;
+
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let contents = toml::to_string_pretty(&index).context("failed to serialize index")?;
+    fs::write(output, contents).with_context(|| format!("failed to write {}", output.display()))?;
+    println!("generated index: {}", output.display());
+    Ok(())
+}
+
+fn collect_skill_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut skills = Vec::new();
+    collect_skill_dirs_inner(root, &mut skills)?;
+    skills.sort();
+    Ok(skills)
+}
+
+fn collect_skill_dirs_inner(path: &Path, skills: &mut Vec<PathBuf>) -> Result<()> {
+    if path.join("SKILL.md").is_file() {
+        skills.push(path.to_path_buf());
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && !is_ignored_scan_dir(&path) {
+            collect_skill_dirs_inner(&path, skills)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn is_ignored_scan_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, ".git" | "target" | "node_modules"))
 }
 
 fn registry_add(manifest_path: &Path, name: &str, config: RegistryConfig) -> Result<()> {
