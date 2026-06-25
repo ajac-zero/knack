@@ -35,12 +35,17 @@ struct Cli {
     /// Optional local root containing skill directories to serve as archives.
     #[arg(long)]
     skills_root: Option<PathBuf>,
+
+    /// Optional registry alias to return as install sources, e.g. company.
+    #[arg(long)]
+    public_alias: Option<String>,
 }
 
 #[derive(Clone)]
 struct AppState {
     index: Arc<RegistryIndex>,
     skills_root: Option<PathBuf>,
+    public_alias: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +60,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         index: Arc::new(index),
         skills_root: cli.skills_root,
+        public_alias: cli.public_alias,
     };
 
     let app = Router::new()
@@ -97,7 +103,14 @@ async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> Json<Vec<IndexedSkill>> {
-    Json(state.index.search(&params.q).into_iter().cloned().collect())
+    let mut results: Vec<IndexedSkill> =
+        state.index.search(&params.q).into_iter().cloned().collect();
+    if let Some(alias) = &state.public_alias {
+        for skill in &mut results {
+            skill.source = format!("{}:{}", alias, skill.name);
+        }
+    }
+    Json(results)
 }
 
 async fn skill_archive(
