@@ -384,7 +384,7 @@ fn registry_add(manifest_path: &Path, name: &str, config: RegistryConfig) -> Res
 
 fn registry_list(manifest_path: &Path) -> Result<()> {
     let manifest = read_manifest(manifest_path)?;
-    for (name, registry) in manifest.registries {
+    for (name, registry) in effective_registries(&manifest)? {
         println!("{}\t{:?}\t{}", name, registry.kind, registry.url);
     }
     Ok(())
@@ -420,6 +420,14 @@ fn read_manifest(manifest_path: &Path) -> Result<Manifest> {
         .with_context(|| format!("failed to read {}", manifest_path.display()))?;
     toml::from_str(&contents)
         .with_context(|| format!("failed to parse {}", manifest_path.display()))
+}
+
+fn read_optional_manifest(manifest_path: &Path) -> Result<Option<Manifest>> {
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+
+    read_manifest(manifest_path).map(Some)
 }
 
 fn write_manifest(manifest_path: &Path, manifest: &Manifest) -> Result<()> {
@@ -560,13 +568,31 @@ fn resolve_source_alias(source: &str, manifest: &Manifest) -> Result<String> {
     let Some((alias, rest)) = source.split_once(':') else {
         return Ok(source.to_string());
     };
-    let Some(registry) = manifest.registries.get(alias) else {
+    let registries = effective_registries(manifest)?;
+    let Some(registry) = registries.get(alias) else {
         return Ok(source.to_string());
     };
 
     match registry.kind {
         RegistryKind::GitHost => resolve_git_host_alias(registry, rest),
     }
+}
+
+fn effective_registries(
+    manifest: &Manifest,
+) -> Result<std::collections::BTreeMap<String, RegistryConfig>> {
+    let mut registries = std::collections::BTreeMap::new();
+
+    if let Some(system) = read_optional_manifest(&Scope::System.manifest_path()?)? {
+        registries.extend(system.registries);
+    }
+
+    if let Some(global) = read_optional_manifest(&Scope::Global.manifest_path()?)? {
+        registries.extend(global.registries);
+    }
+
+    registries.extend(manifest.registries.clone());
+    Ok(registries)
 }
 
 fn resolve_git_host_alias(registry: &RegistryConfig, rest: &str) -> Result<String> {
