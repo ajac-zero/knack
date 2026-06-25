@@ -2,6 +2,7 @@ use std::{
     fs::{self, File},
     io::Cursor,
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -564,6 +565,12 @@ fn install_skill(source: &str, target: &PathBuf) -> Result<InstalledSkill> {
         return install_skill_dir(&fetched.path, target);
     }
 
+    if source.starts_with("git+") {
+        let spec = parse_git_source(source)?;
+        let fetched = fetch_git_skill(&spec)?;
+        return install_skill_dir(&fetched.path, target);
+    }
+
     let source = PathBuf::from(source);
 
     install_local_skill(&source, target)
@@ -652,6 +659,91 @@ fn fetch_github_skill(spec: &str) -> Result<FetchedSkill> {
         path: skill_dir,
         _temp_dir: temp_dir,
     })
+}
+
+#[derive(Debug)]
+struct GitSourceSpec {
+    repo_url: String,
+    reference: String,
+    skill_path: PathBuf,
+}
+
+fn fetch_git_skill(spec: &GitSourceSpec) -> Result<FetchedSkill> {
+    let temp_dir = tempfile::tempdir().context("failed to create temporary directory")?;
+    let repo_dir = temp_dir.path().join("repo");
+    let status = ProcessCommand::new("git")
+        .arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg("--branch")
+        .arg(&spec.reference)
+        .arg(&spec.repo_url)
+        .arg(&repo_dir)
+        .status()
+        .with_context(|| "failed to run git clone; is git installed?")?;
+
+    if !status.success() {
+        bail!(
+            "git clone failed for {} at ref {}",
+            spec.repo_url,
+            spec.reference
+        );
+    }
+
+    let skill_dir = repo_dir.join(&spec.skill_path);
+    let skill = read_skill(&skill_dir).with_context(|| {
+        format!(
+            "Git source did not resolve to a valid skill directory: {}",
+            skill_dir.display()
+        )
+    })?;
+    validate_skill(&skill)?;
+
+    Ok(FetchedSkill {
+        path: skill_dir,
+        _temp_dir: temp_dir,
+    })
+}
+
+fn parse_git_source(source: &str) -> Result<GitSourceSpec> {
+    let (repo_part, skill_path) = source
+        .rsplit_once("//")
+        .ok_or_else(|| anyhow!("git source must be git+<url>[@ref]//path/to/skill"))?;
+    let skill_path = skill_path.trim_matches('/');
+    if skill_path.is_empty() {
+        bail!("git source must include a skill path after //");
+    }
+
+    let without_scheme = repo_part
+        .strip_prefix("git+")
+        .ok_or_else(|| anyhow!("git source must start with git+"))?;
+    let (repo_url, reference) = split_repo_ref(without_scheme, "main")?;
+
+    Ok(GitSourceSpec {
+        repo_url: repo_url.to_string(),
+        reference: reference.to_string(),
+        skill_path: PathBuf::from(skill_path),
+    })
+}
+
+fn split_repo_ref<'a>(repo_with_ref: &'a str, default_ref: &'a str) -> Result<(&'a str, &'a str)> {
+    let at_position = repo_with_ref.rfind('@');
+    let Some(position) = at_position else {
+        return Ok((repo_with_ref, default_ref));
+    };
+
+    let scheme_position = repo_with_ref.find("://");
+    if scheme_position.is_some_and(|scheme| position < scheme) {
+        return Ok((repo_with_ref, default_ref));
+    }
+
+    let (repo, reference_with_at) = repo_with_ref.split_at(position);
+    let reference = &reference_with_at[1..];
+    if repo.is_empty() || reference.is_empty() {
+        bail!("git source repository and ref must not be empty");
+    }
+
+    Ok((repo, reference))
 }
 
 fn parse_github_spec(spec: &str) -> Result<GithubSpec> {
