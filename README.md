@@ -24,6 +24,31 @@ Initialize a project manifest:
 cargo run -p skillhub-cli -- init
 ```
 
+By default, commands use project scope:
+
+```text
+skillhub.toml
+skillhub.lock
+.agents/skills/
+```
+
+Use global scope for user-wide skills:
+
+```bash
+cargo run -p skillhub-cli -- init --scope global
+cargo run -p skillhub-cli -- add gh:anthropics/skills/skills/pdf --scope global
+cargo run -p skillhub-cli -- sync --scope global
+cargo run -p skillhub-cli -- list --scope global
+```
+
+Global scope uses:
+
+```text
+~/.config/skillhub/skillhub.toml
+~/.config/skillhub/skillhub.lock
+~/.agents/skills/
+```
+
 Add and install a skill source into the manifest target:
 
 ```bash
@@ -87,6 +112,7 @@ Implemented:
 - GitHub installation with `gh:owner/repo[@ref]/path/to/skill`.
 - Project manifests with `skillhub.toml`.
 - Lockfiles with `skillhub.lock`.
+- Project and global scoped config/install paths.
 - `add` and `sync` workflows for reproducible project installs.
 - Listing installed skills.
 
