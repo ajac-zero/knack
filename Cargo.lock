@@ -1232,8 +1232,10 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "flate2",
  "serde",
  "skillhub-core",
+ "tar",
  "tokio",
  "toml",
 ]
