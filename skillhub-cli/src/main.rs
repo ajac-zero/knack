@@ -492,7 +492,8 @@ fn add_skill(manifest_path: &Path, source: &str) -> Result<()> {
     let mut manifest = read_manifest(manifest_path)?;
     let lockfile_path = lockfile_path_for(manifest_path);
     let mut lockfile = read_lockfile(&lockfile_path)?;
-    let installed = install_skill(source, &manifest.install.target)?;
+    let resolved_source = resolve_source_alias(source, &manifest)?;
+    let installed = install_skill(&resolved_source, &manifest.install.target)?;
     manifest
         .skills
         .insert(installed.name.clone(), source.to_string());
@@ -501,7 +502,7 @@ fn add_skill(manifest_path: &Path, source: &str) -> Result<()> {
         LockedSkill {
             name: installed.name.clone(),
             source: source.to_string(),
-            resolved: source.to_string(),
+            resolved: resolved_source,
             checksum: checksum_dir(&installed.path)?,
         },
     );
@@ -529,7 +530,8 @@ fn sync_skills(manifest_path: &Path) -> Result<()> {
             .iter()
             .find(|skill| skill.name == *name && skill.source == *source)
             .map(|skill| skill.resolved.clone())
-            .unwrap_or_else(|| source.clone());
+            .map(Ok)
+            .unwrap_or_else(|| resolve_source_alias(source, &manifest))?;
         let installed = install_skill(&resolved, &manifest.install.target)?;
         upsert_lock(
             &mut lockfile,
@@ -545,6 +547,50 @@ fn sync_skills(manifest_path: &Path) -> Result<()> {
 
     write_lockfile(&lockfile_path, &lockfile)?;
     Ok(())
+}
+
+fn resolve_source_alias(source: &str, manifest: &Manifest) -> Result<String> {
+    if source.starts_with("gh:") || source.starts_with("git+") || Path::new(source).exists() {
+        return Ok(source.to_string());
+    }
+
+    let Some((alias, rest)) = source.split_once(':') else {
+        return Ok(source.to_string());
+    };
+    let Some(registry) = manifest.registries.get(alias) else {
+        return Ok(source.to_string());
+    };
+
+    match registry.kind {
+        RegistryKind::GitHost => resolve_git_host_alias(registry, rest),
+    }
+}
+
+fn resolve_git_host_alias(registry: &RegistryConfig, rest: &str) -> Result<String> {
+    let mut parts = rest.splitn(3, '/');
+    let owner = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| anyhow!("registry source must be alias:owner/repo[@ref]/path/to/skill"))?;
+    let repo_with_ref = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| anyhow!("registry source must include a repository"))?;
+    let skill_path = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| anyhow!("registry source must include a skill path"))?;
+    let (repo, reference) = split_repo_ref(repo_with_ref, &registry.default_ref)?;
+    let base_url = registry.url.trim_end_matches('/');
+    let repo_url = if base_url.starts_with("git+ssh://") {
+        format!("{}/{owner}/{repo}.git", base_url.trim_start_matches("git+"))
+    } else if base_url.starts_with("git+") {
+        format!("{}/{owner}/{repo}.git", base_url.trim_start_matches("git+"))
+    } else {
+        format!("{base_url}/{owner}/{repo}.git")
+    };
+
+    Ok(format!("git+{repo_url}@{reference}//{skill_path}"))
 }
 
 fn is_skill_installed(name: &str, target: &Path) -> bool {
@@ -596,7 +642,6 @@ fn install_local_skill(source: &PathBuf, target: &PathBuf) -> Result<InstalledSk
             .with_context(|| format!("failed to unpack {}", source.display()))?;
         let skill = read_skill(&destination)?;
         validate_skill(&skill)?;
-        let skill = read_skill(&destination)?;
         return Ok(InstalledSkill {
             name: skill.name,
             path: destination,
