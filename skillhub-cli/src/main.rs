@@ -10,8 +10,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use flate2::{Compression, write::GzEncoder};
 use skillhub_core::{
-    LockedSkill, Lockfile, Manifest, RegistryConfig, RegistryKind, checksum_dir, collect_files,
-    read_skill, validate_skill, validate_skill_name,
+    IndexedSkill, LockedSkill, Lockfile, Manifest, RegistryConfig, RegistryKind, checksum_dir,
+    collect_files, read_skill, validate_skill, validate_skill_name,
 };
 use tar::{Builder, Header};
 use tempfile::TempDir;
@@ -57,6 +57,20 @@ enum Command {
 
     /// Install all skills declared in the project manifest.
     Sync {
+        /// Path to the project manifest.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Configuration scope to use when --manifest is not provided.
+        #[arg(long, value_enum, default_value_t = Scope::Project)]
+        scope: Scope,
+    },
+
+    /// Find skills to install from configured registries.
+    Find {
+        /// Search query.
+        query: String,
+
         /// Path to the project manifest.
         #[arg(long)]
         manifest: Option<PathBuf>,
@@ -268,6 +282,14 @@ fn main() -> Result<()> {
             let manifest = resolve_manifest_path(manifest, scope)?;
             sync_skills(&manifest)?;
         }
+        Command::Find {
+            query,
+            manifest,
+            scope,
+        } => {
+            let manifest = resolve_manifest_path(manifest, scope)?;
+            find_registry_skills(&manifest, &query)?;
+        }
         Command::Registry { command } => {
             handle_registry_command(command)?;
         }
@@ -368,6 +390,55 @@ fn registry_remove(manifest_path: &Path, name: &str) -> Result<()> {
 
 fn validate_registry_name(name: &str) -> Result<()> {
     validate_skill_name(name).context("registry aliases use the same naming rules as skills")
+}
+
+fn find_registry_skills(manifest_path: &Path, query: &str) -> Result<()> {
+    let query = query.trim();
+    if query.is_empty() {
+        bail!("find query must not be empty");
+    }
+
+    let manifest = read_manifest(manifest_path)?;
+    let registries = effective_registries(&manifest)?;
+    let mut found_any = false;
+
+    for (name, registry) in registries {
+        if !matches!(registry.kind, RegistryKind::Http) {
+            continue;
+        }
+
+        let results = search_http_registry(&registry.url, query)
+            .with_context(|| format!("failed to search registry {name}"))?;
+        for skill in results {
+            found_any = true;
+            println!(
+                "{}\t{}\t{}\t{}",
+                name, skill.name, skill.description, skill.source
+            );
+        }
+    }
+
+    if !found_any {
+        println!("no matching skills found");
+    }
+
+    Ok(())
+}
+
+fn search_http_registry(base_url: &str, query: &str) -> Result<Vec<IndexedSkill>> {
+    let base_url = base_url.trim_end_matches('/');
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{base_url}/search"))
+        .query(&[("q", query)])
+        .header(reqwest::header::USER_AGENT, "skillhub")
+        .send()
+        .with_context(|| format!("failed to query {base_url}/search"))?
+        .error_for_status()
+        .with_context(|| format!("registry returned an error for {base_url}/search"))?;
+
+    response
+        .json()
+        .context("failed to decode registry search results")
 }
 
 fn init_manifest(manifest_path: &Path, target: &Path) -> Result<()> {
