@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug)]
 pub struct Skill {
@@ -113,6 +114,48 @@ pub fn validate_skill_name(name: &str) -> Result<()> {
         .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
     {
         bail!("skill name may only contain lowercase letters, numbers, and hyphens");
+    }
+
+    Ok(())
+}
+
+pub fn checksum_dir(path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for file in collect_files(path)? {
+        let relative_path = file.strip_prefix(path).with_context(|| {
+            format!(
+                "failed to make {} relative to {}",
+                file.display(),
+                path.display()
+            )
+        })?;
+        hasher.update(relative_path.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        hasher
+            .update(fs::read(&file).with_context(|| format!("failed to read {}", file.display()))?);
+        hasher.update([0]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+pub fn collect_files(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_files_inner(path, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_files_inner(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            collect_files_inner(&path, files)?;
+        } else if file_type.is_file() {
+            files.push(path);
+        }
     }
 
     Ok(())

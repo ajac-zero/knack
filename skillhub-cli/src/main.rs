@@ -9,10 +9,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use flate2::{Compression, write::GzEncoder};
-use sha2::{Digest, Sha256};
 use skillhub_core::{
-    LockedSkill, Lockfile, Manifest, RegistryConfig, RegistryKind, read_skill, validate_skill,
-    validate_skill_name,
+    LockedSkill, Lockfile, Manifest, RegistryConfig, RegistryKind, checksum_dir, collect_files,
+    read_skill, validate_skill, validate_skill_name,
 };
 use tar::{Builder, Header};
 use tempfile::TempDir;
@@ -443,25 +442,6 @@ fn upsert_lock(lockfile: &mut Lockfile, locked_skill: LockedSkill) {
     lockfile
         .skill
         .sort_by(|left, right| left.name.cmp(&right.name));
-}
-
-fn checksum_dir(path: &Path) -> Result<String> {
-    let mut hasher = Sha256::new();
-    for file in collect_files(path)? {
-        let relative_path = file.strip_prefix(path).with_context(|| {
-            format!(
-                "failed to make {} relative to {}",
-                file.display(),
-                path.display()
-            )
-        })?;
-        hasher.update(relative_path.to_string_lossy().as_bytes());
-        hasher.update([0]);
-        hasher
-            .update(fs::read(&file).with_context(|| format!("failed to read {}", file.display()))?);
-        hasher.update([0]);
-    }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn add_skill(manifest_path: &Path, source: &str) -> Result<()> {
@@ -944,29 +924,6 @@ fn pack_skill(path: &PathBuf, output: &PathBuf) -> Result<PathBuf> {
 
     archive.finish()?;
     Ok(archive_path)
-}
-
-fn collect_files(path: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    collect_files_inner(path, &mut files)?;
-    files.sort();
-    Ok(files)
-}
-
-fn collect_files_inner(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-
-        if file_type.is_dir() {
-            collect_files_inner(&path, files)?;
-        } else if file_type.is_file() {
-            files.push(path);
-        }
-    }
-
-    Ok(())
 }
 
 fn append_file(

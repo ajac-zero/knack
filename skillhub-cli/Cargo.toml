@@ -15,7 +15,6 @@ flate2 = "1.1.5"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_yaml = "0.9.34"
-sha2 = "0.10.9"
 skillhub-core = { path = "../skillhub-core" }
 tar = "0.4.44"
 tempfile = "3.24.0"
