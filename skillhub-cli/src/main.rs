@@ -26,12 +26,16 @@ enum Command {
     /// Create a skillhub.toml manifest in the current project.
     Init {
         /// Path where the manifest should be written.
-        #[arg(long, default_value = "skillhub.toml")]
-        manifest: PathBuf,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
 
         /// Directory where project skills should be installed.
-        #[arg(long, default_value = ".agents/skills")]
-        target: PathBuf,
+        #[arg(long)]
+        target: Option<PathBuf>,
+
+        /// Configuration scope to initialize.
+        #[arg(long, value_enum, default_value_t = Scope::Project)]
+        scope: Scope,
     },
 
     /// Install a skill source and record it in the project manifest.
@@ -40,15 +44,23 @@ enum Command {
         source: String,
 
         /// Path to the project manifest.
-        #[arg(long, default_value = "skillhub.toml")]
-        manifest: PathBuf,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Configuration scope to use when --manifest is not provided.
+        #[arg(long, value_enum, default_value_t = Scope::Project)]
+        scope: Scope,
     },
 
     /// Install all skills declared in the project manifest.
     Sync {
         /// Path to the project manifest.
-        #[arg(long, default_value = "skillhub.toml")]
-        manifest: PathBuf,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Configuration scope to use when --manifest is not provided.
+        #[arg(long, value_enum, default_value_t = Scope::Project)]
+        scope: Scope,
     },
 
     /// Create a new skill directory.
@@ -83,15 +95,23 @@ enum Command {
         source: String,
 
         /// Directory where skills should be installed.
-        #[arg(long, default_value = ".agents/skills")]
-        target: PathBuf,
+        #[arg(long)]
+        target: Option<PathBuf>,
+
+        /// Install target scope to use when --target is not provided.
+        #[arg(long, value_enum, default_value_t = Scope::Project)]
+        scope: Scope,
     },
 
     /// List installed skills.
     List {
         /// Directory containing installed skills.
-        #[arg(long, default_value = ".agents/skills")]
-        target: PathBuf,
+        #[arg(long)]
+        target: Option<PathBuf>,
+
+        /// List target scope to use when --target is not provided.
+        #[arg(long, value_enum, default_value_t = Scope::Project)]
+        scope: Scope,
     },
 }
 
@@ -129,17 +149,43 @@ fn home_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("HOME is not set; cannot resolve global skill directory"))
 }
 
+fn resolve_manifest_path(manifest: Option<PathBuf>, scope: Scope) -> Result<PathBuf> {
+    match manifest {
+        Some(path) => Ok(path),
+        None => scope.manifest_path(),
+    }
+}
+
+fn resolve_target_path(target: Option<PathBuf>, scope: Scope) -> Result<PathBuf> {
+    match target {
+        Some(path) => Ok(path),
+        None => scope.install_target(),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Init { manifest, target } => {
+        Command::Init {
+            manifest,
+            target,
+            scope,
+        } => {
+            let manifest = resolve_manifest_path(manifest, scope)?;
+            let target = resolve_target_path(target, scope)?;
             init_manifest(&manifest, &target)?;
         }
-        Command::Add { source, manifest } => {
+        Command::Add {
+            source,
+            manifest,
+            scope,
+        } => {
+            let manifest = resolve_manifest_path(manifest, scope)?;
             add_skill(&manifest, &source)?;
         }
-        Command::Sync { manifest } => {
+        Command::Sync { manifest, scope } => {
+            let manifest = resolve_manifest_path(manifest, scope)?;
             sync_skills(&manifest)?;
         }
         Command::New { name, dir } => {
@@ -154,11 +200,17 @@ fn main() -> Result<()> {
             let archive = pack_skill(&path, &output)?;
             println!("packed skill: {}", archive.display());
         }
-        Command::Install { source, target } => {
+        Command::Install {
+            source,
+            target,
+            scope,
+        } => {
+            let target = resolve_target_path(target, scope)?;
             let installed = install_skill(&source, &target)?;
             println!("installed skill: {}", installed.path.display());
         }
-        Command::List { target } => {
+        Command::List { target, scope } => {
+            let target = resolve_target_path(target, scope)?;
             list_skills(&target)?;
         }
     }
@@ -220,6 +272,10 @@ fn read_manifest(manifest_path: &Path) -> Result<Manifest> {
 }
 
 fn write_manifest(manifest_path: &Path, manifest: &Manifest) -> Result<()> {
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
     let contents = toml::to_string_pretty(manifest).context("failed to serialize manifest")?;
     fs::write(manifest_path, contents)
         .with_context(|| format!("failed to write {}", manifest_path.display()))
@@ -241,6 +297,10 @@ fn read_lockfile(lockfile_path: &Path) -> Result<Lockfile> {
 }
 
 fn write_lockfile(lockfile_path: &Path, lockfile: &Lockfile) -> Result<()> {
+    if let Some(parent) = lockfile_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
     let contents = toml::to_string_pretty(lockfile).context("failed to serialize lockfile")?;
     fs::write(lockfile_path, contents)
         .with_context(|| format!("failed to write {}", lockfile_path.display()))
