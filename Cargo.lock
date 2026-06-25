@@ -1118,9 +1118,17 @@ dependencies = [
  "serde",
  "serde_yaml",
  "sha2",
+ "skillhub-core",
  "tar",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "skillhub-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

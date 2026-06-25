@@ -9,8 +9,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use flate2::{Compression, write::GzEncoder};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use skillhub_core::{LockedSkill, Lockfile, Manifest, RegistryConfig, RegistryKind};
 use tar::{Builder, Header};
 use tempfile::TempDir;
 
@@ -133,8 +134,8 @@ enum RegistryCommand {
         url: String,
 
         /// Registry backend type.
-        #[arg(long, value_enum, default_value_t = RegistryKind::GitHost)]
-        kind: RegistryKind,
+        #[arg(long, value_enum, default_value_t = RegistryKindArg::GitHost)]
+        kind: RegistryKindArg,
 
         /// Default Git ref for git-host registries.
         #[arg(long, default_value = "main")]
@@ -175,10 +176,17 @@ enum RegistryCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-enum RegistryKind {
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RegistryKindArg {
     GitHost,
+}
+
+impl From<RegistryKindArg> for RegistryKind {
+    fn from(kind: RegistryKindArg) -> Self {
+        match kind {
+            RegistryKindArg::GitHost => Self::GitHost,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -290,51 +298,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct Manifest {
-    install: InstallConfig,
-    #[serde(default)]
-    skills: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
-    registries: std::collections::BTreeMap<String, RegistryConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct RegistryConfig {
-    kind: RegistryKind,
-    url: String,
-    default_ref: String,
-}
-
-#[derive(Debug, Default, Deserialize, Serialize)]
-struct Lockfile {
-    #[serde(default)]
-    skill: Vec<LockedSkill>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct LockedSkill {
-    name: String,
-    source: String,
-    resolved: String,
-    checksum: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct InstallConfig {
-    target: PathBuf,
-}
-
-impl Manifest {
-    fn new(target: PathBuf) -> Self {
-        Self {
-            install: InstallConfig { target },
-            skills: std::collections::BTreeMap::new(),
-            registries: std::collections::BTreeMap::new(),
-        }
-    }
-}
-
 fn handle_registry_command(command: RegistryCommand) -> Result<()> {
     match command {
         RegistryCommand::Add {
@@ -350,7 +313,7 @@ fn handle_registry_command(command: RegistryCommand) -> Result<()> {
                 &manifest_path,
                 &name,
                 RegistryConfig {
-                    kind,
+                    kind: kind.into(),
                     url,
                     default_ref,
                 },

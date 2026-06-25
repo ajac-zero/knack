@@ -3,4 +3,5 @@ resolver = "3"
 members = [
     "skillhub-cli",
     "skillhub-registry",
+    "skillhub-core",
 ]
