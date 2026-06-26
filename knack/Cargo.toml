@@ -1,9 +1,16 @@
 [package]
 name = "knack"
-version = "0.1.1"
-edition = "2024"
 description = "CLI for packaging, discovering, and installing Agent Skills"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../README.md"
+keywords = ["agent", "ai", "skill", "cli", "package-manager"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "knack"
@@ -17,7 +24,7 @@ flate2 = "1.1.5"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_yaml = "0.9.34"
-knack-core = { version = "0.1.1", path = "../knack-core" }
+knack-core = { version = "0.1.0", path = "../knack-core" }
 tar = "0.4.44"
 tempfile = "3.24.0"
 toml = "0.9.8"

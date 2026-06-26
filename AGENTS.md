@@ -64,7 +64,13 @@ Commit message convention (visible in `jj log`): Conventional Commits with scope
 
 ## Publishing notes
 
-The `repository` field was deliberately removed from all `Cargo.toml`s during the rename, and the `registry = "gitea"` marker was dropped from the `knack-core` dependency in `knack/Cargo.toml`. Both must be re-added before publishing to any registry. The previous gitea setup is documented in commit `tyrrtzzq build: make crates publishable to gitea`.
+The three crates are configured for crates.io. Shared metadata (`version`, `edition`, `rust-version`, `license`, `repository`, `homepage`, `authors`, `readme`) lives in `[workspace.package]` in the root `Cargo.toml`; each crate inherits via `field.workspace = true`. Per-crate fields (`description`, `keywords`, `categories`) stay in the crate's own `Cargo.toml`.
+
+**Publish order is forced**: `knack-core` first, then `knack` and `knack-registry` (both depend on `knack-core` by both `version` and `path`).
+
+`rust-version = "1.85"` is the MSRV (edition 2024 requirement). Bump it deliberately if you raise the floor.
+
+The earlier gitea publishing setup (commit `tyrrtzzq build: make crates publishable to gitea`) was dropped during the rename and is not currently configured.
 
 ## Things to leave alone
 

@@ -1,7 +1,16 @@
 [package]
 name = "knack-registry"
-version = "0.1.0"
-edition = "2024"
+description = "Self-hostable HTTP registry server for knack Agent Skills"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../README.md"
+keywords = ["agent", "ai", "skill", "registry", "server"]
+categories = ["command-line-utilities", "web-programming::http-server"]
 
 [dependencies]
 anyhow = "1.0.98"
@@ -9,7 +18,7 @@ axum = "0.8.7"
 clap = { version = "4.5.40", features = ["derive"] }
 flate2 = "1.1.5"
 serde = { version = "1.0.219", features = ["derive"] }
-knack-core = { path = "../knack-core" }
+knack-core = { version = "0.1.0", path = "../knack-core" }
 tar = "0.4.44"
 tempfile = "3.24.0"
 tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread", "signal"] }

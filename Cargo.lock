@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "knack"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "knack-core"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
