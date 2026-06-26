@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -21,6 +22,7 @@ use flate2::{Compression, write::GzEncoder};
 use serde::Deserialize;
 use skillhub_core::{IndexedSkill, RegistryIndex, collect_files, read_skill, validate_skill};
 use tar::{Builder, Header};
+use tokio::sync::RwLock;
 
 #[derive(Debug, Parser)]
 #[command(name = "skillhub-registry")]
@@ -45,11 +47,16 @@ struct Cli {
     /// Source alias used to resolve backing sources, e.g. tea=git+ssh://git@gitea.example.com.
     #[arg(long = "source-alias")]
     source_aliases: Vec<String>,
+
+    /// Periodically refresh dynamic sources. Set to 0 to disable background refresh.
+    #[arg(long, default_value_t = 300)]
+    refresh_interval_seconds: u64,
 }
 
 #[derive(Clone)]
 struct AppState {
-    index: Arc<RegistryIndex>,
+    index: Arc<RwLock<RegistryIndex>>,
+    index_path: PathBuf,
     skills_root: Option<PathBuf>,
     public_alias: Option<String>,
     source_aliases: BTreeMap<String, String>,
@@ -63,15 +70,24 @@ struct SearchParams {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut index = read_index(&cli.index)?;
     let source_aliases = parse_source_aliases(&cli.source_aliases)?;
-    materialize_dynamic_sources(&mut index, &source_aliases)?;
+    let index = refresh_index(&cli.index, &source_aliases)?;
     let state = AppState {
-        index: Arc::new(index),
+        index: Arc::new(RwLock::new(index)),
+        index_path: cli.index,
         skills_root: cli.skills_root,
         public_alias: cli.public_alias,
         source_aliases,
     };
+
+    if cli.refresh_interval_seconds > 0 {
+        spawn_refresh_task(
+            state.index.clone(),
+            state.index_path.clone(),
+            state.source_aliases.clone(),
+            Duration::from_secs(cli.refresh_interval_seconds),
+        );
+    }
 
     let app = Router::new()
         .route("/health", get(health))
@@ -99,6 +115,40 @@ fn read_index(path: &PathBuf) -> Result<RegistryIndex> {
         toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))?;
     index.validate()?;
     Ok(index)
+}
+
+fn refresh_index(
+    path: &PathBuf,
+    source_aliases: &BTreeMap<String, String>,
+) -> Result<RegistryIndex> {
+    let mut index = read_index(path)?;
+    materialize_dynamic_sources(&mut index, source_aliases)?;
+    Ok(index)
+}
+
+fn spawn_refresh_task(
+    index: Arc<RwLock<RegistryIndex>>,
+    index_path: PathBuf,
+    source_aliases: BTreeMap<String, String>,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match refresh_index(&index_path, &source_aliases) {
+                Ok(refreshed) => {
+                    let mut index = index.write().await;
+                    *index = refreshed;
+                    eprintln!("refreshed skillhub registry index");
+                }
+                Err(error) => {
+                    eprintln!("failed to refresh skillhub registry index: {error:#}");
+                }
+            }
+        }
+    });
 }
 
 fn materialize_dynamic_sources(
@@ -184,15 +234,16 @@ async fn health() -> &'static str {
 }
 
 async fn get_index(State(state): State<AppState>) -> Json<RegistryIndex> {
-    Json((*state.index).clone())
+    Json(state.index.read().await.clone())
 }
 
 async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> Json<Vec<IndexedSkill>> {
-    let mut results: Vec<IndexedSkill> =
-        state.index.search(&params.q).into_iter().cloned().collect();
+    let index = state.index.read().await;
+    let mut results: Vec<IndexedSkill> = index.search(&params.q).into_iter().cloned().collect();
+    drop(index);
     if let Some(alias) = &state.public_alias {
         for skill in &mut results {
             skill.source = format!("{}:{}", alias, skill.name);
@@ -205,7 +256,7 @@ async fn skill_archive(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Response {
-    match create_skill_archive(&state, &name) {
+    match create_skill_archive(&state, &name).await {
         Ok(bytes) => (
             [
                 (header::CONTENT_TYPE, "application/gzip"),
@@ -221,7 +272,7 @@ async fn skill_archive(
     }
 }
 
-fn create_skill_archive(state: &AppState, name: &str) -> Result<Vec<u8>> {
+async fn create_skill_archive(state: &AppState, name: &str) -> Result<Vec<u8>> {
     if let Some(skills_root) = &state.skills_root {
         let skill_dir = skills_root.join(name);
         if skill_dir.join("SKILL.md").is_file() {
@@ -229,13 +280,15 @@ fn create_skill_archive(state: &AppState, name: &str) -> Result<Vec<u8>> {
         }
     }
 
-    let indexed = state
-        .index
+    let index = state.index.read().await;
+    let source = index
         .skill
         .iter()
         .find(|skill| skill.name == name)
+        .map(|skill| skill.source.clone())
         .with_context(|| format!("skill not found: {name}"))?;
-    let fetched = fetch_backing_source(&indexed.source, state)?;
+    drop(index);
+    let fetched = fetch_backing_source(&source, state)?;
     create_skill_archive_from_dir(&fetched.path)
 }
 

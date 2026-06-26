@@ -239,6 +239,8 @@ tags = ["deploy", "kubernetes"]
 
 At startup, that materializes skills such as `tea:platform/agent-skills/deploy-container` from `platform/agent-skills/deploy-container/SKILL.md`. This avoids duplicating fragile metadata in `skillhub.index.toml`.
 
+Dynamic sources must refresh successfully on startup before the registry serves traffic. After startup, the registry refreshes dynamic sources every 300 seconds by default and keeps serving the last good index if a later refresh fails. Disable background refresh with `--refresh-interval-seconds 0` or tune it with another interval.
+
 Static entries are still supported for hand-curated overrides:
 
 ```toml
@@ -256,6 +258,7 @@ cargo run -p skillhub-registry -- \
   --index skillhub.index.toml \
   --public-alias company \
   --source-alias tea=git+ssh://git@gitea.example.com \
+  --refresh-interval-seconds 300 \
   --bind 127.0.0.1:7349
 ```
 
