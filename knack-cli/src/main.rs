@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use flate2::{Compression, write::GzEncoder};
-use skillhub_core::{
+use knack_core::{
     IndexedSkill, LockedSkill, Lockfile, Manifest, RegistryConfig, RegistryIndex, RegistryKind,
     checksum_dir, collect_files, read_skill, validate_skill, validate_skill_name,
 };
@@ -17,7 +17,7 @@ use tar::{Builder, Header};
 use tempfile::TempDir;
 
 #[derive(Debug, Parser)]
-#[command(name = "skillhub")]
+#[command(name = "knack")]
 #[command(version, about = "Package, share, and install Agent Skills")]
 struct Cli {
     #[command(subcommand)]
@@ -26,7 +26,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Create a skillhub.toml manifest.
+    /// Create a knack.toml manifest.
     Init {
         /// Path where the manifest should be written.
         #[arg(long)]
@@ -186,7 +186,7 @@ enum IndexCommand {
         source_prefix: String,
 
         /// Output index file.
-        #[arg(short, long, default_value = "skillhub.index.toml")]
+        #[arg(short, long, default_value = "knack.index.toml")]
         output: PathBuf,
     },
 }
@@ -269,9 +269,9 @@ enum Scope {
 impl Scope {
     fn manifest_path(self) -> Result<PathBuf> {
         match self {
-            Self::Project => Ok(PathBuf::from(".agents/skillhub.toml")),
-            Self::Global => Ok(config_dir()?.join("skillhub.toml")),
-            Self::System => Ok(PathBuf::from("/etc/skillhub/skillhub.toml")),
+            Self::Project => Ok(PathBuf::from(".agents/knack.toml")),
+            Self::Global => Ok(config_dir()?.join("knack.toml")),
+            Self::System => Ok(PathBuf::from("/etc/knack/knack.toml")),
         }
     }
 
@@ -279,13 +279,13 @@ impl Scope {
         match self {
             Self::Project => Ok(PathBuf::from(".agents/skills")),
             Self::Global => Ok(home_dir()?.join(".agents/skills")),
-            Self::System => Ok(PathBuf::from("/usr/local/share/skillhub/skills")),
+            Self::System => Ok(PathBuf::from("/usr/local/share/knack/skills")),
         }
     }
 }
 
 fn config_dir() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("io", "skillhub", "skillhub")
+    let dirs = ProjectDirs::from("io", "knack", "knack")
         .ok_or_else(|| anyhow!("failed to resolve global config directory"))?;
     Ok(dirs.config_dir().to_path_buf())
 }
@@ -574,7 +574,7 @@ fn find_registry_skills(manifest_path: &Path, query: &str) -> Result<()> {
     for (skill_name, registry_name, source) in matches {
         println!("\n{}", skill_name);
         println!("  registry: {}", registry_name);
-        println!("  install:  skillhub add {}", source);
+        println!("  install:  knack add {}", source);
     }
 
     Ok(())
@@ -625,7 +625,7 @@ fn publish_skill(
     generate_index(
         &checkout.join(skills_dir),
         &source_prefix,
-        &checkout.join("skillhub.index.toml"),
+        &checkout.join("knack.index.toml"),
     )?;
 
     run_git(["add", "."], Some(&checkout), "stage published skill")?;
@@ -689,7 +689,7 @@ fn search_http_registry(base_url: &str, query: &str) -> Result<Vec<IndexedSkill>
     let response = reqwest::blocking::Client::new()
         .get(format!("{base_url}/search"))
         .query(&[("q", query)])
-        .header(reqwest::header::USER_AGENT, "skillhub")
+        .header(reqwest::header::USER_AGENT, "knack")
         .send()
         .with_context(|| format!("failed to query {base_url}/search"))?
         .error_for_status()
@@ -737,7 +737,7 @@ fn write_manifest(manifest_path: &Path, manifest: &Manifest) -> Result<()> {
 }
 
 fn lockfile_path_for(manifest_path: &Path) -> PathBuf {
-    manifest_path.with_file_name("skillhub.lock")
+    manifest_path.with_file_name("knack.lock")
 }
 
 fn read_lockfile(lockfile_path: &Path) -> Result<Lockfile> {
@@ -859,7 +859,7 @@ fn resolve_source_alias(source: &str, manifest: &Manifest) -> Result<String> {
 fn resolve_http_alias(registry: &RegistryConfig, rest: &str) -> Result<String> {
     validate_skill_name(rest)?;
     Ok(format!(
-        "http+skillhub:{}/skills/{}/archive",
+        "http+knack:{}/skills/{}/archive",
         registry.url.trim_end_matches('/'),
         rest
     ))
@@ -933,7 +933,7 @@ fn install_skill(source: &str, target: &PathBuf) -> Result<InstalledSkill> {
         return install_skill_dir(&fetched.path, target);
     }
 
-    if let Some(url) = source.strip_prefix("http+skillhub:") {
+    if let Some(url) = source.strip_prefix("http+knack:") {
         return install_http_skill_archive(url, target);
     }
 
@@ -946,7 +946,7 @@ fn install_http_skill_archive(url: &str, target: &Path) -> Result<InstalledSkill
     fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
     let response = reqwest::blocking::Client::new()
         .get(url)
-        .header(reqwest::header::USER_AGENT, "skillhub")
+        .header(reqwest::header::USER_AGENT, "knack")
         .send()
         .with_context(|| format!("failed to download {url}"))?
         .error_for_status()
@@ -1002,7 +1002,7 @@ fn fetch_github_skill(spec: &str) -> Result<FetchedSkill> {
 
     let response = reqwest::blocking::Client::new()
         .get(&archive_url)
-        .header(reqwest::header::USER_AGENT, "skillhub")
+        .header(reqwest::header::USER_AGENT, "knack")
         .send()
         .with_context(|| format!("failed to fetch {archive_url}"))?
         .error_for_status()

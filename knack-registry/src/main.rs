@@ -20,16 +20,16 @@ use axum::{
 use clap::Parser;
 use flate2::{Compression, write::GzEncoder};
 use serde::Deserialize;
-use skillhub_core::{IndexedSkill, RegistryIndex, collect_files, read_skill, validate_skill};
+use knack_core::{IndexedSkill, RegistryIndex, collect_files, read_skill, validate_skill};
 use tar::{Builder, Header};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Parser)]
-#[command(name = "skillhub-registry")]
-#[command(version, about = "Serve and search a Skillhub registry index")]
+#[command(name = "knack-registry")]
+#[command(version, about = "Serve and search a knack registry index")]
 struct Cli {
-    /// Path to a skillhub registry index TOML file.
-    #[arg(long, default_value = "skillhub.index.toml")]
+    /// Path to a knack registry index TOML file.
+    #[arg(long, default_value = "knack.index.toml")]
     index: PathBuf,
 
     /// Address to bind.
@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(cli.bind)
         .await
         .with_context(|| format!("failed to bind {}", cli.bind))?;
-    println!("skillhub-registry listening on http://{}", cli.bind);
+    println!("knack-registry listening on http://{}", cli.bind);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -141,10 +141,10 @@ fn spawn_refresh_task(
                 Ok(refreshed) => {
                     let mut index = index.write().await;
                     *index = refreshed;
-                    eprintln!("refreshed skillhub registry index");
+                    eprintln!("refreshed knack registry index");
                 }
                 Err(error) => {
-                    eprintln!("failed to refresh skillhub registry index: {error:#}");
+                    eprintln!("failed to refresh knack registry index: {error:#}");
                 }
             }
         }

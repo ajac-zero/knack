@@ -1,8 +1,8 @@
-# skillhub
+# knack
 
-`skillhub` is an open-source Rust CLI and self-hostable registry for teams to package, validate, version, publish, discover, install, and govern Agent Skills.
+`knack` is an open-source Rust CLI and self-hostable registry for teams to package, validate, version, publish, discover, install, and govern Agent Skills.
 
-Agent Skills are portable folders built around a `SKILL.md` file that give AI agents reusable capabilities, workflows, and domain knowledge. `skillhub` turns those folders into manageable team infrastructure: searchable, reproducible, auditable, and safe to distribute across projects and agent clients.
+Agent Skills are portable folders built around a `SKILL.md` file that give AI agents reusable capabilities, workflows, and domain knowledge. `knack` turns those folders into manageable team infrastructure: searchable, reproducible, auditable, and safe to distribute across projects and agent clients.
 
 ## North Star
 
@@ -20,7 +20,7 @@ The missing layer is shared distribution and governance.
 
 ## Purpose
 
-`skillhub` exists to help teams:
+`knack` exists to help teams:
 
 - Create valid Agent Skills quickly.
 - Validate skills against the open Agent Skills format and team policy.
@@ -34,7 +34,7 @@ The missing layer is shared distribution and governance.
 
 ## Value
 
-`skillhub` should deliver value in four areas.
+`knack` should deliver value in four areas.
 
 ### Reuse
 
@@ -50,11 +50,11 @@ Organizations should know which skills exist, who owns them, which versions are 
 
 ### Trust
 
-Agent instructions can influence tool use and code changes. `skillhub` should treat skill distribution as a supply-chain problem, with checksums, provenance, policy checks, and eventually signing and approval workflows.
+Agent instructions can influence tool use and code changes. `knack` should treat skill distribution as a supply-chain problem, with checksums, provenance, policy checks, and eventually signing and approval workflows.
 
 ## Differentiators
 
-`skillhub` is not just a folder copier, prompt library, or vendor-specific marketplace.
+`knack` is not just a folder copier, prompt library, or vendor-specific marketplace.
 
 The differentiators are:
 
@@ -68,7 +68,7 @@ The differentiators are:
 - Security-focused design for scripts, provenance, and trusted registries.
 - A static or Git-backed registry path before requiring a full server.
 
-The short pitch: `skillhub` is private package management for Agent Skills.
+The short pitch: `knack` is private package management for Agent Skills.
 
 ## Users
 
@@ -78,10 +78,10 @@ Developers want to search, install, update, and remove useful skills without kno
 
 Important workflows:
 
-- `skillhub search rust`
-- `skillhub install platform/rust-code-review`
-- `skillhub list`
-- `skillhub update`
+- `knack search rust`
+- `knack install platform/rust-code-review`
+- `knack list`
+- `knack update`
 
 ### Engineering Teams
 
@@ -121,7 +121,7 @@ Important workflows:
 
 ## Product Shape
 
-`skillhub` has two main components.
+`knack` has two main components.
 
 ### CLI
 
@@ -156,11 +156,11 @@ The project should support a low-friction registry path first:
 GitHub should also be supported as an early first-class source backend. This lets users install a skill directly from a repository path without running any registry infrastructure:
 
 ```bash
-skillhub install gh:owner/repo/path/to/skill
-skillhub install gh:owner/repo@v1.2.0/path/to/skill
+knack install gh:owner/repo/path/to/skill
+knack install gh:owner/repo@v1.2.0/path/to/skill
 ```
 
-This is not a replacement for the long-term registry. It is a pragmatic bridge that makes `skillhub` easy to try, works naturally for OSS skills, and gives teams a simple private-sharing path through GitHub repositories.
+This is not a replacement for the long-term registry. It is a pragmatic bridge that makes `knack` easy to try, works naturally for OSS skills, and gives teams a simple private-sharing path through GitHub repositories.
 
 A full self-hosted server can follow:
 
@@ -182,23 +182,23 @@ Installed skills should remain portable. A user should be able to copy an instal
 
 ### Package
 
-A package is a versioned skill artifact suitable for distribution through `skillhub`.
+A package is a versioned skill artifact suitable for distribution through `knack`.
 
 The package may include optional registry metadata, but `SKILL.md` remains the canonical runtime entrypoint.
 
 ### Registry
 
-A registry is a source of package metadata and artifacts. Registries can be static, Git-backed, or served by the `skillhub` registry server.
+A registry is a source of package metadata and artifacts. Registries can be static, Git-backed, or served by the `knack` registry server.
 
 ### Source
 
-A source is any location `skillhub install` can resolve into a skill directory. Initial sources include local directories, local package archives, and GitHub repository paths. Future sources include static registries, Git repositories, and the `skillhub` registry server.
+A source is any location `knack install` can resolve into a skill directory. Initial sources include local directories, local package archives, and GitHub repository paths. Future sources include static registries, Git repositories, and the `knack` registry server.
 
 ### Manifest
 
 A project manifest declares which skills a project wants.
 
-Default project file: `.agents/skillhub.toml`
+Default project file: `.agents/knack.toml`
 
 ```toml
 [registry]
@@ -217,7 +217,7 @@ target = ".agents/skills"
 
 A lockfile records exact resolved versions, sources, and checksums.
 
-Default project file: `.agents/skillhub.lock`
+Default project file: `.agents/knack.lock`
 
 ```toml
 [[package]]
@@ -302,18 +302,18 @@ Important later capabilities:
 
 - Should the first registry backend be static HTTP, Git, or both?
 - What package archive extension should be used: `.skill.tgz`, `.skill.tar.zst`, or another format?
-- Should registry metadata live only in `SKILL.md` frontmatter at first, or should `skillhub` introduce an optional `skill.toml` package manifest?
+- Should registry metadata live only in `SKILL.md` frontmatter at first, or should `knack` introduce an optional `skill.toml` package manifest?
 - How strict should validation be by default versus compatibility mode?
 - Which client-specific install targets should be supported after `.agents/skills/`?
 - Should GitHub installs use archive downloads, sparse Git checkouts, or the GitHub Contents API for private repositories?
 
 ## Success Criteria
 
-`skillhub` is succeeding if:
+`knack` is succeeding if:
 
 - A team can create, publish, and install a skill in minutes.
 - A repository can declare its expected skills and reproduce them on another machine.
 - Users can discover internal skills without searching wikis or Slack.
 - Platform teams can curate and distribute approved skill bundles.
 - Security teams can inspect, verify, and eventually enforce policy on skills.
-- Installed skills remain plain Agent Skills that work outside `skillhub`.
+- Installed skills remain plain Agent Skills that work outside `knack`.

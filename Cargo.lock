@@ -707,6 +707,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "knack-cli"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "directories",
+ "flate2",
+ "knack-core",
+ "reqwest",
+ "serde",
+ "serde_yaml",
+ "tar",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "knack-core"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_yaml",
+ "sha2",
+]
+
+[[package]]
+name = "knack-registry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "flate2",
+ "knack-core",
+ "serde",
+ "tar",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1197,49 +1240,6 @@ name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
-
-[[package]]
-name = "skillhub-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "directories",
- "flate2",
- "reqwest",
- "serde",
- "serde_yaml",
- "skillhub-core",
- "tar",
- "tempfile",
- "toml",
-]
-
-[[package]]
-name = "skillhub-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_yaml",
- "sha2",
-]
-
-[[package]]
-name = "skillhub-registry"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "flate2",
- "serde",
- "skillhub-core",
- "tar",
- "tempfile",
- "tokio",
- "toml",
-]
 
 [[package]]
 name = "slab"

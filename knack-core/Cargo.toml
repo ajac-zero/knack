@@ -1,7 +1,9 @@
 [package]
-name = "skillhub-core"
-version = "0.1.0"
+name = "knack-core"
+version = "0.1.1"
 edition = "2024"
+description = "Core types and validation for knack Agent Skills tooling"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0.98"

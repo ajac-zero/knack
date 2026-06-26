@@ -1,10 +1,12 @@
 [package]
-name = "skillhub-cli"
-version = "0.1.0"
+name = "knack-cli"
+version = "0.1.1"
 edition = "2024"
+description = "CLI for packaging, discovering, and installing Agent Skills"
+license = "MIT"
 
 [[bin]]
-name = "skillhub"
+name = "knack"
 path = "src/main.rs"
 
 [dependencies]
@@ -15,7 +17,7 @@ flate2 = "1.1.5"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_yaml = "0.9.34"
-skillhub-core = { path = "../skillhub-core" }
+knack-core = { version = "0.1.1", path = "../knack-core" }
 tar = "0.4.44"
 tempfile = "3.24.0"
 toml = "0.9.8"

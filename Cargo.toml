@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
-    "skillhub-cli",
-    "skillhub-registry",
-    "skillhub-core",
+    "knack-cli",
+    "knack-registry",
+    "knack-core",
 ]
