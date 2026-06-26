@@ -229,6 +229,34 @@ Users can install without knowing the backing Git repo:
 cargo run -p skillhub-cli -- add company:deploy-container
 ```
 
+For skills scattered across multiple Git repositories, keep the index entries pointed at backing sources and let the registry proxy them:
+
+```toml
+[[skill]]
+name = "deploy-container"
+description = "Deploy containers into the internal Kubernetes cluster."
+source = "tea:payments/api/.agents/skills/deploy-container"
+tags = ["deploy", "kubernetes"]
+```
+
+Start the registry with a source alias so it can fetch those backing sources server-side:
+
+```bash
+cargo run -p skillhub-registry -- \
+  --index skillhub.index.toml \
+  --public-alias company \
+  --source-alias tea=git+ssh://git@gitea.example.com \
+  --bind 127.0.0.1:7349
+```
+
+Users still only need the HTTP registry:
+
+```bash
+cargo run -p skillhub-cli -- registry add company http://127.0.0.1:7349 --kind http
+cargo run -p skillhub-cli -- find deploy
+cargo run -p skillhub-cli -- add company:deploy-container
+```
+
 Publish a local skill into a git-backed team skills repository:
 
 ```bash
@@ -266,6 +294,7 @@ Implemented:
 - Git-host registry aliases with `alias:owner/repo[@ref]/path/to/skill`.
 - Searchable HTTP registries served by `skillhub-registry`.
 - Proxied HTTP registry installs with `registry:skill-name`.
+- Registry-side proxying from indexed Git backing sources.
 - Registry index generation from local skill directories.
 - Publishing skills to git-backed team repositories.
 - Project manifests with `skillhub.toml`.
