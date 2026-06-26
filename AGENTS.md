@@ -12,7 +12,7 @@ registry for Agent Skills.
 
 Three crates (Cargo workspace, edition 2024, `resolver = "3"`):
 
-- `knack-cli/` — produces the **`knack`** binary (note: binary name ≠ crate name).
+- `knack/` — produces the `knack` binary (this is the published CLI crate).
 - `knack-registry/` — produces the `knack-registry` binary.
 - `knack-core/` — shared library; **the only crate with unit tests** (4 in `src/lib.rs`).
 
@@ -23,7 +23,7 @@ Async/sync split: **CLI uses `reqwest` blocking**; **registry uses `tokio`/`axum
 ```bash
 cargo build --workspace                # full check
 cargo test -p knack-core               # the only tests that exist
-cargo run -p knack-cli -- --help       # exercise the CLI
+cargo run -p knack -- --help           # exercise the CLI
 cargo run -p knack-registry -- --help  # exercise the registry
 ```
 
@@ -46,7 +46,7 @@ Commit message convention (visible in `jj log`): Conventional Commits with scope
 
 ## Architecture notes that aren't obvious from filenames
 
-**Config scope layering** (`knack-cli/src/main.rs`, `enum Scope`): registries from `system` (`/etc/knack/knack.toml`) and `global` (`~/.config/knack/knack.toml`) are merged into the effective set used by `project` (`.agents/knack.toml`). Later layers override earlier ones. See `effective_registries()`.
+**Config scope layering** (`knack/src/main.rs`, `enum Scope`): registries from `system` (`/etc/knack/knack.toml`) and `global` (`~/.config/knack/knack.toml`) are merged into the effective set used by `project` (`.agents/knack.toml`). Later layers override earlier ones. See `effective_registries()`.
 
 **Custom source URL schemes the CLI parses** (project vocabulary; not standards):
 
@@ -64,7 +64,7 @@ Commit message convention (visible in `jj log`): Conventional Commits with scope
 
 ## Publishing notes
 
-The `repository` field was deliberately removed from all `Cargo.toml`s during the rename, and the `registry = "gitea"` marker was dropped from the `knack-core` dependency in `knack-cli/Cargo.toml`. Both must be re-added before publishing to any registry. The previous gitea setup is documented in commit `tyrrtzzq build: make crates publishable to gitea`.
+The `repository` field was deliberately removed from all `Cargo.toml`s during the rename, and the `registry = "gitea"` marker was dropped from the `knack-core` dependency in `knack/Cargo.toml`. Both must be re-added before publishing to any registry. The previous gitea setup is documented in commit `tyrrtzzq build: make crates publishable to gitea`.
 
 ## Things to leave alone
 

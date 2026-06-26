@@ -5,7 +5,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY knack-core ./knack-core
 COPY knack-registry ./knack-registry
-COPY knack-cli ./knack-cli
+COPY knack ./knack
 
 RUN cargo build --release -p knack-registry
 
