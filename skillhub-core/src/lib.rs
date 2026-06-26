@@ -217,6 +217,8 @@ pub enum RegistryKind {
 pub struct RegistryIndex {
     #[serde(default)]
     pub skill: Vec<IndexedSkill>,
+    #[serde(default)]
+    pub source: Vec<IndexSource>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -228,10 +230,20 @@ pub struct IndexedSkill {
     pub tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IndexSource {
+    pub source: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
 impl RegistryIndex {
     pub fn validate(&self) -> Result<()> {
         for skill in &self.skill {
             skill.validate()?;
+        }
+        for source in &self.source {
+            source.validate()?;
         }
         Ok(())
     }
@@ -252,6 +264,15 @@ impl RegistryIndex {
                 terms.iter().all(|term| haystack.contains(term))
             })
             .collect()
+    }
+}
+
+impl IndexSource {
+    pub fn validate(&self) -> Result<()> {
+        if self.source.trim().is_empty() {
+            bail!("indexed source must not be empty");
+        }
+        Ok(())
     }
 }
 
@@ -317,6 +338,7 @@ mod tests {
                     tags: vec!["rust".to_string()],
                 },
             ],
+            source: Vec::new(),
         };
 
         assert_eq!(index.search("pdf").len(), 1);

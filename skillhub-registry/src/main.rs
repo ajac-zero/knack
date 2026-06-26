@@ -63,12 +63,14 @@ struct SearchParams {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let index = read_index(&cli.index)?;
+    let mut index = read_index(&cli.index)?;
+    let source_aliases = parse_source_aliases(&cli.source_aliases)?;
+    materialize_dynamic_sources(&mut index, &source_aliases)?;
     let state = AppState {
         index: Arc::new(index),
         skills_root: cli.skills_root,
         public_alias: cli.public_alias,
-        source_aliases: parse_source_aliases(&cli.source_aliases)?,
+        source_aliases,
     };
 
     let app = Router::new()
@@ -97,6 +99,84 @@ fn read_index(path: &PathBuf) -> Result<RegistryIndex> {
         toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))?;
     index.validate()?;
     Ok(index)
+}
+
+fn materialize_dynamic_sources(
+    index: &mut RegistryIndex,
+    source_aliases: &BTreeMap<String, String>,
+) -> Result<()> {
+    let static_skill_names: Vec<String> =
+        index.skill.iter().map(|skill| skill.name.clone()).collect();
+    let dynamic_sources = index.source.clone();
+    for source in dynamic_sources {
+        let fetched = fetch_source_root(&source.source, source_aliases)?;
+        for skill_dir in collect_skill_dirs(&fetched.path)? {
+            let skill = read_skill(&skill_dir)?;
+            validate_skill(&skill)?;
+            if static_skill_names.iter().any(|name| name == &skill.name)
+                || index.skill.iter().any(|indexed| indexed.name == skill.name)
+            {
+                continue;
+            }
+            let relative = skill_dir.strip_prefix(&fetched.path).with_context(|| {
+                format!(
+                    "failed to make {} relative to {}",
+                    skill_dir.display(),
+                    fetched.path.display()
+                )
+            })?;
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let skill_source = if relative.is_empty() {
+                source.source.clone()
+            } else {
+                format!("{}/{}", source.source.trim_end_matches('/'), relative)
+            };
+            index.skill.push(IndexedSkill {
+                name: skill.name,
+                description: skill.description,
+                source: skill_source,
+                tags: source.tags.clone(),
+            });
+        }
+    }
+    index
+        .skill
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    index.validate()?;
+    Ok(())
+}
+
+fn collect_skill_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut skills = Vec::new();
+    collect_skill_dirs_inner(root, &mut skills)?;
+    skills.sort();
+    Ok(skills)
+}
+
+fn collect_skill_dirs_inner(path: &Path, skills: &mut Vec<PathBuf>) -> Result<()> {
+    if path.join("SKILL.md").is_file() {
+        skills.push(path.to_path_buf());
+        return Ok(());
+    }
+
+    for entry in
+        std::fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && !is_ignored_scan_dir(&path) {
+            collect_skill_dirs_inner(&path, skills)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn is_ignored_scan_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, ".git" | "target" | "node_modules"))
 }
 
 async fn health() -> &'static str {
@@ -189,11 +269,21 @@ struct FetchedBackingSource {
 }
 
 fn fetch_backing_source(source: &str, state: &AppState) -> Result<FetchedBackingSource> {
+    fetch_source_root(source, &state.source_aliases).and_then(|fetched| {
+        let skill = read_skill(&fetched.path)?;
+        validate_skill(&skill)?;
+        Ok(fetched)
+    })
+}
+
+fn fetch_source_root(
+    source: &str,
+    source_aliases: &BTreeMap<String, String>,
+) -> Result<FetchedBackingSource> {
     let (alias, rest) = source
         .split_once(':')
         .ok_or_else(|| anyhow::anyhow!("backing source must be alias:owner/repo[@ref]/path"))?;
-    let base_url = state
-        .source_aliases
+    let base_url = source_aliases
         .get(alias)
         .with_context(|| format!("source alias not configured on registry: {alias}"))?;
     let git = parse_git_host_source(base_url, rest)?;
@@ -220,8 +310,6 @@ fn fetch_backing_source(source: &str, state: &AppState) -> Result<FetchedBacking
     }
 
     let skill_dir = repo_dir.join(git.skill_path);
-    let skill = read_skill(&skill_dir)?;
-    validate_skill(&skill)?;
     Ok(FetchedBackingSource {
         path: skill_dir,
         _temp_dir: temp_dir,
@@ -245,10 +333,7 @@ fn parse_git_host_source(base_url: &str, rest: &str) -> Result<GitBackingSource>
         .next()
         .filter(|part| !part.is_empty())
         .context("backing source must include repository")?;
-    let skill_path = parts
-        .next()
-        .filter(|part| !part.is_empty())
-        .context("backing source must include skill path")?;
+    let skill_path = parts.next().unwrap_or("");
     let (repo, reference) = split_repo_ref(repo_with_ref, "main")?;
     let base_url = base_url
         .trim_end_matches('/')

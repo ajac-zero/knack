@@ -229,7 +229,17 @@ Users can install without knowing the backing Git repo:
 cargo run -p skillhub-cli -- add company:deploy-container
 ```
 
-For skills scattered across multiple Git repositories, keep the index entries pointed at backing sources and let the registry proxy them:
+For skills scattered across one or more Git repositories, prefer dynamic source entries. The registry fetches the backing source, scans for `SKILL.md`, and derives each skill's name and description from the skill itself:
+
+```toml
+[[source]]
+source = "tea:platform/agent-skills"
+tags = ["deploy", "kubernetes"]
+```
+
+At startup, that materializes skills such as `tea:platform/agent-skills/deploy-container` from `platform/agent-skills/deploy-container/SKILL.md`. This avoids duplicating fragile metadata in `skillhub.index.toml`.
+
+Static entries are still supported for hand-curated overrides:
 
 ```toml
 [[skill]]
