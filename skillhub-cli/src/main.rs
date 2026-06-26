@@ -557,9 +557,10 @@ fn find_registry_skills(manifest_path: &Path, query: &str) -> Result<()> {
             .with_context(|| format!("failed to search registry {name}"))?;
         for skill in results {
             found_any = true;
+            let source = format!("{}:{}", name, skill.name);
             println!(
                 "{}\t{}\t{}\t{}",
-                name, skill.name, skill.description, skill.source
+                name, skill.name, skill.description, source
             );
         }
     }
