@@ -546,7 +546,7 @@ fn find_registry_skills(manifest_path: &Path, query: &str) -> Result<()> {
 
     let manifest = read_manifest(manifest_path)?;
     let registries = effective_registries(&manifest)?;
-    let mut found_any = false;
+    let mut matches = Vec::new();
 
     for (name, registry) in registries {
         if !matches!(registry.kind, RegistryKind::Http) {
@@ -556,17 +556,25 @@ fn find_registry_skills(manifest_path: &Path, query: &str) -> Result<()> {
         let results = search_http_registry(&registry.url, query)
             .with_context(|| format!("failed to search registry {name}"))?;
         for skill in results {
-            found_any = true;
             let source = format!("{}:{}", name, skill.name);
-            println!(
-                "{}\t{}\t{}\t{}",
-                name, skill.name, skill.description, source
-            );
+            matches.push((skill.name, name.clone(), source));
         }
     }
 
-    if !found_any {
+    if matches.is_empty() {
         println!("no matching skills found");
+        return Ok(());
+    }
+
+    println!(
+        "found {} skill{}:",
+        matches.len(),
+        if matches.len() == 1 { "" } else { "s" }
+    );
+    for (skill_name, registry_name, source) in matches {
+        println!("\n{}", skill_name);
+        println!("  registry: {}", registry_name);
+        println!("  install:  skillhub add {}", source);
     }
 
     Ok(())
