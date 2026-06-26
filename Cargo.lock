@@ -1236,6 +1236,7 @@ dependencies = [
  "serde",
  "skillhub-core",
  "tar",
+ "tempfile",
  "tokio",
  "toml",
 ]
