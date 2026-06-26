@@ -1,0 +1,6 @@
+target/
+.git/
+.jj/
+.opencode/
+**/.DS_Store
+**/*.skill.tar.gz

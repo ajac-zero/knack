@@ -161,6 +161,37 @@ Serve the index with `skillhub-registry`:
 cargo run -p skillhub-registry -- --index skillhub.index.toml --bind 127.0.0.1:7349
 ```
 
+Build and run the registry container:
+
+```bash
+docker build -t skillhub-registry .
+docker run --rm -p 7349:7349 \
+  -v "$PWD:/data:ro" \
+  skillhub-registry
+```
+
+The image defaults to:
+
+```bash
+skillhub-registry \
+  --index /data/skillhub.index.toml \
+  --skills-root /data/skills \
+  --public-alias company \
+  --bind 0.0.0.0:7349
+```
+
+Override arguments as needed:
+
+```bash
+docker run --rm -p 7349:7349 \
+  -v "$PWD:/data:ro" \
+  skillhub-registry \
+  --index /data/skillhub.index.toml \
+  --skills-root /data/skills \
+  --public-alias platform \
+  --bind 0.0.0.0:7349
+```
+
 To make the HTTP registry the only thing users need to interact with, serve skill archives too:
 
 ```bash
