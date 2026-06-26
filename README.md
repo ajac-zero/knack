@@ -27,8 +27,8 @@ cargo run -p skillhub-cli -- init
 By default, commands use project scope:
 
 ```text
-skillhub.toml
-skillhub.lock
+.agents/skillhub.toml
+.agents/skillhub.lock
 .agents/skills/
 ```
 
@@ -69,7 +69,7 @@ Registry aliases are inherited in this order, with later layers overriding earli
 ```text
 system (/etc/skillhub/skillhub.toml)
 global (~/.config/skillhub/skillhub.toml)
-project (./skillhub.toml)
+project (./.agents/skillhub.toml)
 ```
 
 That lets administrators inject aliases such as `tea:` for all users while still allowing user or project-level overrides.
@@ -80,9 +80,9 @@ Add and install a skill source into the manifest target:
 cargo run -p skillhub-cli -- add gh:anthropics/skills/skills/pdf
 ```
 
-This updates `skillhub.toml` and writes `skillhub.lock` with the resolved source and a deterministic checksum of the installed skill contents.
+This updates `.agents/skillhub.toml` and writes `.agents/skillhub.lock` with the resolved source and a deterministic checksum of the installed skill contents.
 
-Sync all skills declared in `skillhub.toml`:
+Sync all skills declared in `.agents/skillhub.toml`:
 
 ```bash
 cargo run -p skillhub-cli -- sync

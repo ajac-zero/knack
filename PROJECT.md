@@ -198,7 +198,7 @@ A source is any location `skillhub install` can resolve into a skill directory. 
 
 A project manifest declares which skills a project wants.
 
-Potential file: `skills.toml`
+Default project file: `.agents/skillhub.toml`
 
 ```toml
 [registry]
@@ -217,7 +217,7 @@ target = ".agents/skills"
 
 A lockfile records exact resolved versions, sources, and checksums.
 
-Potential file: `skills.lock`
+Default project file: `.agents/skillhub.lock`
 
 ```toml
 [[package]]
@@ -303,7 +303,6 @@ Important later capabilities:
 - Should the first registry backend be static HTTP, Git, or both?
 - What package archive extension should be used: `.skill.tgz`, `.skill.tar.zst`, or another format?
 - Should registry metadata live only in `SKILL.md` frontmatter at first, or should `skillhub` introduce an optional `skill.toml` package manifest?
-- Should project manifests be named `skills.toml`, `skillhub.toml`, or something else?
 - How strict should validation be by default versus compatibility mode?
 - Which client-specific install targets should be supported after `.agents/skills/`?
 - Should GitHub installs use archive downloads, sparse Git checkouts, or the GitHub Contents API for private repositories?

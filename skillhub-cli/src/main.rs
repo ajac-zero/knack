@@ -26,7 +26,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Create a skillhub.toml manifest in the current project.
+    /// Create a skillhub.toml manifest.
     Init {
         /// Path where the manifest should be written.
         #[arg(long)]
@@ -269,7 +269,7 @@ enum Scope {
 impl Scope {
     fn manifest_path(self) -> Result<PathBuf> {
         match self {
-            Self::Project => Ok(PathBuf::from("skillhub.toml")),
+            Self::Project => Ok(PathBuf::from(".agents/skillhub.toml")),
             Self::Global => Ok(config_dir()?.join("skillhub.toml")),
             Self::System => Ok(PathBuf::from("/etc/skillhub/skillhub.toml")),
         }
