@@ -27,7 +27,9 @@ cargo run -p knack -- --help           # exercise the CLI
 cargo run -p knack-registry -- --help  # exercise the registry
 ```
 
-No CI, no `rustfmt.toml`, no `clippy.toml`. Defaults apply, none of it is enforced anywhere except locally. Run `cargo fmt` / `cargo clippy --workspace` before committing meaningful changes.
+CI runs `fmt`, `clippy --workspace --all-targets -- -D warnings`, and `test --workspace` on every push to `main` and every PR (`.github/workflows/ci.yml`). Run the same three locally before pushing or CI will go red. No `rustfmt.toml` or `clippy.toml` — defaults apply.
+
+Releases are automated by `release-plz` (`.github/workflows/release-plz.yml`). Push Conventional Commits to `main`; release-plz opens a PR bumping versions and updating changelogs. Merging that PR publishes to crates.io in dependency order. Requires the `CARGO_REGISTRY_TOKEN` secret on the repo. Manual `cargo publish` is still possible but should not be needed.
 
 ## Recent rename: `skillhub` → `knack`
 
