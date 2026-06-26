@@ -19,8 +19,8 @@ use axum::{
 };
 use clap::Parser;
 use flate2::{Compression, write::GzEncoder};
-use serde::Deserialize;
 use knack_core::{IndexedSkill, RegistryIndex, collect_files, read_skill, validate_skill};
+use serde::Deserialize;
 use tar::{Builder, Header};
 use tokio::sync::RwLock;
 
@@ -299,8 +299,8 @@ fn create_skill_archive_from_dir(skill_dir: &Path) -> Result<Vec<u8>> {
     let buffer = Vec::new();
     let encoder = GzEncoder::new(buffer, Compression::default());
     let mut archive = Builder::new(encoder);
-    for file in collect_files(&skill_dir)? {
-        let relative = file.strip_prefix(&skill_dir).with_context(|| {
+    for file in collect_files(skill_dir)? {
+        let relative = file.strip_prefix(skill_dir).with_context(|| {
             format!(
                 "failed to make {} relative to {}",
                 file.display(),

@@ -898,9 +898,7 @@ fn resolve_git_host_alias(registry: &RegistryConfig, rest: &str) -> Result<Strin
         .ok_or_else(|| anyhow!("registry source must include a skill path"))?;
     let (repo, reference) = split_repo_ref(repo_with_ref, &registry.default_ref)?;
     let base_url = registry.url.trim_end_matches('/');
-    let repo_url = if base_url.starts_with("git+ssh://") {
-        format!("{}/{owner}/{repo}.git", base_url.trim_start_matches("git+"))
-    } else if base_url.starts_with("git+") {
+    let repo_url = if base_url.starts_with("git+") {
         format!("{}/{owner}/{repo}.git", base_url.trim_start_matches("git+"))
     } else {
         format!("{base_url}/{owner}/{repo}.git")
@@ -965,7 +963,7 @@ fn install_archive_reader<R: std::io::Read>(reader: R, target: &Path) -> Result<
     install_skill_dir(&root, target)
 }
 
-fn install_local_skill(source: &PathBuf, target: &PathBuf) -> Result<InstalledSkill> {
+fn install_local_skill(source: &Path, target: &Path) -> Result<InstalledSkill> {
     if source.is_dir() {
         return install_skill_dir(source, target);
     }
@@ -1136,7 +1134,6 @@ fn parse_github_spec(spec: &str) -> Result<GithubSpec> {
 
     let (repo, reference) = repo_with_ref
         .split_once('@')
-        .map(|(repo, reference)| (repo, reference))
         .unwrap_or((repo_with_ref, "main"));
 
     if repo.is_empty() || reference.is_empty() {
