@@ -1,27 +1,55 @@
 # knack
 
+[![Crates.io](https://img.shields.io/crates/v/knack.svg)](https://crates.io/crates/knack)
+[![Docs.rs](https://docs.rs/knack-core/badge.svg)](https://docs.rs/knack-core)
+[![CI](https://github.com/ajac-zero/knack/actions/workflows/ci.yml/badge.svg)](https://github.com/ajac-zero/knack/actions/workflows/ci.yml)
+[![License](https://img.shields.io/crates/l/knack.svg)](https://github.com/ajac-zero/knack/blob/main/LICENSE)
+
 `knack` is an open-source Rust CLI and self-hostable registry project for teams to package, validate, version, publish, discover, install, and govern Agent Skills.
 
 The current v0 focuses on local skill authoring and distribution primitives. See [`PROJECT.md`](PROJECT.md) for the north-star product direction.
 
-## Current CLI
+## Install
 
-Run the CLI from the workspace:
+Install the CLI from crates.io:
 
 ```bash
-cargo run -p knack -- --help
+cargo install knack
 ```
+
+Install the registry server:
+
+```bash
+cargo install knack-registry
+```
+
+Or build both from source:
+
+```bash
+git clone https://github.com/ajac-zero/knack
+cd knack
+cargo build --release
+# Binaries land at target/release/knack and target/release/knack-registry
+```
+
+Verify the install:
+
+```bash
+knack --help
+```
+
+## Usage
 
 Create a skill:
 
 ```bash
-cargo run -p knack -- new rust-code-review
+knack new rust-code-review
 ```
 
 Initialize a project manifest:
 
 ```bash
-cargo run -p knack -- init
+knack init
 ```
 
 By default, commands use project scope:
@@ -35,10 +63,10 @@ By default, commands use project scope:
 Use global scope for user-wide skills:
 
 ```bash
-cargo run -p knack -- init --scope global
-cargo run -p knack -- add gh:anthropics/skills/skills/pdf --scope global
-cargo run -p knack -- sync --scope global
-cargo run -p knack -- list --scope global
+knack init --scope global
+knack add gh:anthropics/skills/skills/pdf --scope global
+knack sync --scope global
+knack list --scope global
 ```
 
 Global scope uses:
@@ -52,8 +80,8 @@ Global scope uses:
 Admins can provide system-wide defaults with system scope:
 
 ```bash
-cargo run -p knack -- init --scope system
-cargo run -p knack -- registry add tea git+ssh://git@gitea.example.com --scope system
+knack init --scope system
+knack registry add tea git+ssh://git@gitea.example.com --scope system
 ```
 
 System scope uses:
@@ -77,7 +105,7 @@ That lets administrators inject aliases such as `tea:` for all users while still
 Add and install a skill source into the manifest target:
 
 ```bash
-cargo run -p knack -- add gh:anthropics/skills/skills/pdf
+knack add gh:anthropics/skills/skills/pdf
 ```
 
 This updates `.agents/knack.toml` and writes `.agents/knack.lock` with the resolved source and a deterministic checksum of the installed skill contents.
@@ -85,60 +113,60 @@ This updates `.agents/knack.toml` and writes `.agents/knack.lock` with the resol
 Sync all skills declared in `.agents/knack.toml`:
 
 ```bash
-cargo run -p knack -- sync
+knack sync
 ```
 
 Validate a skill:
 
 ```bash
-cargo run -p knack -- validate rust-code-review
+knack validate rust-code-review
 ```
 
 Package a skill:
 
 ```bash
-cargo run -p knack -- pack rust-code-review --output dist
+knack pack rust-code-review --output dist
 ```
 
 Install a skill directory or package archive:
 
 ```bash
-cargo run -p knack -- install rust-code-review --target .agents/skills
-cargo run -p knack -- install dist/rust-code-review.skill.tar.gz --target .agents/skills
+knack install rust-code-review --target .agents/skills
+knack install dist/rust-code-review.skill.tar.gz --target .agents/skills
 ```
 
 Install directly from a public GitHub repository:
 
 ```bash
-cargo run -p knack -- install gh:owner/repo/path/to/skill --target .agents/skills
-cargo run -p knack -- install gh:owner/repo@ref/path/to/skill --target .agents/skills
+knack install gh:owner/repo/path/to/skill --target .agents/skills
+knack install gh:owner/repo@ref/path/to/skill --target .agents/skills
 ```
 
 For example:
 
 ```bash
-cargo run -p knack -- install gh:anthropics/skills/skills/pdf --target .agents/skills
+knack install gh:anthropics/skills/skills/pdf --target .agents/skills
 ```
 
 Install from any Git host supported by your local `git` command:
 
 ```bash
-cargo run -p knack -- install git+https://git.example.com/org/skills.git//path/to/skill
-cargo run -p knack -- install git+ssh://git@git.example.com/org/skills.git@main//path/to/skill
+knack install git+https://git.example.com/org/skills.git//path/to/skill
+knack install git+ssh://git@git.example.com/org/skills.git@main//path/to/skill
 ```
 
 Register a Git host alias in `knack.toml`:
 
 ```bash
-cargo run -p knack -- registry add tea git+ssh://git@gitea.example.com
-cargo run -p knack -- registry list
+knack registry add tea git+ssh://git@gitea.example.com
+knack registry list
 ```
 
 Then add skills through the alias:
 
 ```bash
-cargo run -p knack -- add tea:platform/agent-skills/rust-code-review
-cargo run -p knack -- add tea:platform/agent-skills@v1.2.0/rust-code-review
+knack add tea:platform/agent-skills/rust-code-review
+knack add tea:platform/agent-skills@v1.2.0/rust-code-review
 ```
 
 Alias syntax is:
@@ -150,7 +178,7 @@ alias:owner/repo[@ref]/path/to/skill
 Generate a searchable registry index from a local tree of skills:
 
 ```bash
-cargo run -p knack -- index generate ./skills \
+knack index generate ./skills \
   --source-prefix gh:owner/repo/skills \
   --output knack.index.toml
 ```
@@ -158,7 +186,7 @@ cargo run -p knack -- index generate ./skills \
 Serve the index with `knack-registry`:
 
 ```bash
-cargo run -p knack-registry -- --index knack.index.toml --bind 127.0.0.1:7349
+knack-registry --index knack.index.toml --bind 127.0.0.1:7349
 ```
 
 Build and run the registry container:
@@ -195,7 +223,7 @@ docker run --rm -p 7349:7349 \
 To make the HTTP registry the only thing users need to interact with, serve skill archives too:
 
 ```bash
-cargo run -p knack-registry -- \
+knack-registry \
   --index knack.index.toml \
   --skills-root ./skills \
   --public-alias company \
@@ -207,8 +235,8 @@ With `--public-alias company`, search results return proxy install sources such 
 Register and search that registry from the CLI:
 
 ```bash
-cargo run -p knack -- registry add local http://127.0.0.1:7349 --kind http
-cargo run -p knack -- find pdf
+knack registry add local http://127.0.0.1:7349 --kind http
+knack find pdf
 ```
 
 Search results are installable sources:
@@ -226,7 +254,7 @@ company	deploy-container	Deploy containers to Kubernetes. 	company:deploy-contai
 Users can install without knowing the backing Git repo:
 
 ```bash
-cargo run -p knack -- add company:deploy-container
+knack add company:deploy-container
 ```
 
 For skills scattered across one or more Git repositories, prefer dynamic source entries. The registry fetches the backing source, scans for `SKILL.md`, and derives each skill's name and description from the skill itself:
@@ -254,7 +282,7 @@ tags = ["deploy", "kubernetes"]
 Start the registry with a source alias so it can fetch those backing sources server-side:
 
 ```bash
-cargo run -p knack-registry -- \
+knack-registry \
   --index knack.index.toml \
   --public-alias company \
   --source-alias tea=git+ssh://git@gitea.example.com \
@@ -265,16 +293,16 @@ cargo run -p knack-registry -- \
 Users still only need the HTTP registry:
 
 ```bash
-cargo run -p knack -- registry add company http://127.0.0.1:7349 --kind http
-cargo run -p knack -- find deploy
-cargo run -p knack -- add company:deploy-container
+knack registry add company http://127.0.0.1:7349 --kind http
+knack find deploy
+knack add company:deploy-container
 ```
 
 Publish a local skill into a git-backed team skills repository:
 
 ```bash
-cargo run -p knack -- registry add tea git+ssh://git@gitea.example.com
-cargo run -p knack -- publish ./my-skill \
+knack registry add tea git+ssh://git@gitea.example.com
+knack publish ./my-skill \
   --registry tea \
   --repo platform/agent-skills
 ```
@@ -284,14 +312,14 @@ Publishing currently supports `git-host` registries. It clones the target reposi
 After the registry server is serving the updated `knack.index.toml`, teammates can discover and install the skill:
 
 ```bash
-cargo run -p knack -- find my-skill
-cargo run -p knack -- add tea:platform/agent-skills/skills/my-skill
+knack find my-skill
+knack add tea:platform/agent-skills/skills/my-skill
 ```
 
 List installed skills:
 
 ```bash
-cargo run -p knack -- list --target .agents/skills
+knack list --target .agents/skills
 ```
 
 ## v0 Scope
