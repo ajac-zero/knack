@@ -17,6 +17,8 @@ name = "knack"
 path = "src/main.rs"
 
 [dependencies]
+anstream = "1.0.0"
+anstyle = "1.0.13"
 anyhow = "1.0.98"
 clap = { version = "4.5.40", features = ["derive"] }
 directories = "6.0.0"

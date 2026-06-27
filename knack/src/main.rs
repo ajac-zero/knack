@@ -1,10 +1,12 @@
 use std::{
+    fmt,
     fs::{self, File},
     io::Cursor,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
 };
 
+use anstyle::{AnsiColor, Effects, Style};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
@@ -310,6 +312,39 @@ fn resolve_target_path(target: Option<PathBuf>, scope: Scope) -> Result<PathBuf>
     }
 }
 
+fn success_style() -> Style {
+    AnsiColor::Green.on_default() | Effects::BOLD
+}
+
+fn accent_style() -> Style {
+    AnsiColor::Cyan.on_default() | Effects::BOLD
+}
+
+fn label_style() -> Style {
+    AnsiColor::Blue.on_default() | Effects::BOLD
+}
+
+fn status(action: &str, value: impl fmt::Display) {
+    let action_style = success_style();
+    let value_style = accent_style();
+    anstream::println!(
+        "{action_style}{action}{action_style:#} {value_style}{value}{value_style:#}"
+    );
+}
+
+fn notice(message: &str) {
+    let message_style = success_style();
+    anstream::println!("{message_style}{message}{message_style:#}");
+}
+
+fn label_value(label: &str, value: impl fmt::Display) {
+    let label_style = label_style();
+    let value_style = accent_style();
+    anstream::println!(
+        "  {label_style}{label:<9}{label_style:#} {value_style}{value}{value_style:#}"
+    );
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -367,11 +402,11 @@ fn main() -> Result<()> {
         Command::Validate { path } => {
             let skill = read_skill(&path)?;
             validate_skill(&skill)?;
-            println!("valid skill: {}", skill.name);
+            status("valid skill:", skill.name);
         }
         Command::Pack { path, output } => {
             let archive = pack_skill(&path, &output)?;
-            println!("packed skill: {}", archive.display());
+            status("packed skill:", archive.display());
         }
         Command::Install {
             source,
@@ -380,7 +415,7 @@ fn main() -> Result<()> {
         } => {
             let target = resolve_target_path(target, scope)?;
             let installed = install_skill(&source, &target)?;
-            println!("installed skill: {}", installed.path.display());
+            status("installed skill:", installed.path.display());
         }
         Command::List { target, scope } => {
             let target = resolve_target_path(target, scope)?;
@@ -472,7 +507,7 @@ fn generate_index(root: &Path, source_prefix: &str, output: &Path) -> Result<()>
     }
     let contents = toml::to_string_pretty(&index).context("failed to serialize index")?;
     fs::write(output, contents).with_context(|| format!("failed to write {}", output.display()))?;
-    println!("generated index: {}", output.display());
+    status("generated index:", output.display());
     Ok(())
 }
 
@@ -512,14 +547,20 @@ fn registry_add(manifest_path: &Path, name: &str, config: RegistryConfig) -> Res
     let mut manifest = read_manifest(manifest_path)?;
     manifest.registries.insert(name.to_string(), config);
     write_manifest(manifest_path, &manifest)?;
-    println!("registered registry: {name}");
+    status("registered registry:", name);
     Ok(())
 }
 
 fn registry_list(manifest_path: &Path) -> Result<()> {
     let manifest = read_manifest(manifest_path)?;
     for (name, registry) in effective_registries(&manifest)? {
-        println!("{}\t{:?}\t{}", name, registry.kind, registry.url);
+        let name_style = accent_style();
+        let label_style = label_style();
+        anstream::println!(
+            "{name_style}{name}{name_style:#}\t{label_style}{:?}{label_style:#}\t{}",
+            registry.kind,
+            registry.url
+        );
     }
     Ok(())
 }
@@ -530,7 +571,7 @@ fn registry_remove(manifest_path: &Path, name: &str) -> Result<()> {
         bail!("registry not found: {name}");
     }
     write_manifest(manifest_path, &manifest)?;
-    println!("removed registry: {name}");
+    status("removed registry:", name);
     Ok(())
 }
 
@@ -562,19 +603,28 @@ fn find_registry_skills(manifest_path: &Path, query: &str) -> Result<()> {
     }
 
     if matches.is_empty() {
-        println!("no matching skills found");
+        notice("no matching skills found");
         return Ok(());
     }
 
-    println!(
-        "found {} skill{}:",
+    let heading_style = label_style();
+    let count_style = accent_style();
+    anstream::println!(
+        "{heading_style}found{heading_style:#} {count_style}{}{count_style:#} skill{}:",
         matches.len(),
         if matches.len() == 1 { "" } else { "s" }
     );
     for (skill_name, registry_name, source) in matches {
-        println!("\n{}", skill_name);
-        println!("  registry: {}", registry_name);
-        println!("  install:  knack add {}", source);
+        let skill_style = accent_style();
+        anstream::println!("\n{skill_style}{skill_name}{skill_style:#}");
+        label_value("registry:", registry_name);
+        let label_style = label_style();
+        let source_style = accent_style();
+        anstream::println!(
+            "  {label_style}{:<9}{label_style:#} knack add {source_style}{}{source_style:#}",
+            "install:",
+            source
+        );
     }
 
     Ok(())
@@ -636,7 +686,7 @@ fn publish_skill(
         .output()
         .context("failed to inspect publish repository status")?;
     if status_output.stdout.is_empty() {
-        println!("nothing to publish: {}", skill.name);
+        status("nothing to publish:", skill.name);
         return Ok(());
     }
 
@@ -650,7 +700,7 @@ fn publish_skill(
         run_git(["push"], Some(&checkout), "push published skill")?;
     }
 
-    println!("published skill: {}", skill.name);
+    status("published skill:", skill.name);
     Ok(())
 }
 
@@ -707,7 +757,7 @@ fn init_manifest(manifest_path: &Path, target: &Path) -> Result<()> {
 
     let manifest = Manifest::new(target.to_path_buf());
     write_manifest(manifest_path, &manifest)?;
-    println!("created manifest: {}", manifest_path.display());
+    status("created manifest:", manifest_path.display());
     Ok(())
 }
 
@@ -796,7 +846,14 @@ fn add_skill(manifest_path: &Path, source: &str) -> Result<()> {
     );
     write_manifest(manifest_path, &manifest)?;
     write_lockfile(&lockfile_path, &lockfile)?;
-    println!("added skill: {} from {}", installed.name, source);
+    let action_style = success_style();
+    let value_style = accent_style();
+    let label_style = label_style();
+    anstream::println!(
+        "{action_style}added skill:{action_style:#} {value_style}{}{value_style:#} {label_style}from{label_style:#} {value_style}{}{value_style:#}",
+        installed.name,
+        source
+    );
     Ok(())
 }
 
@@ -809,7 +866,7 @@ fn sync_skills(manifest_path: &Path) -> Result<()> {
 
     for (name, source) in &manifest.skills {
         if is_skill_installed(name, &manifest.install.target) {
-            println!("already installed: {name}");
+            status("already installed:", name);
             continue;
         }
 
@@ -830,7 +887,7 @@ fn sync_skills(manifest_path: &Path) -> Result<()> {
                 checksum: checksum_dir(&installed.path)?,
             },
         );
-        println!("synced skill: {}", installed.name);
+        status("synced skill:", installed.name);
     }
 
     write_lockfile(&lockfile_path, &lockfile)?;
@@ -1203,7 +1260,8 @@ fn list_skills(target: &PathBuf) -> Result<()> {
 
     skills.sort();
     for skill in skills {
-        println!("{skill}");
+        let skill_style = accent_style();
+        anstream::println!("{skill_style}{skill}{skill_style:#}");
     }
 
     Ok(())
@@ -1309,6 +1367,6 @@ fn new_skill(name: &str, dir: PathBuf) -> Result<()> {
     fs::write(&skill_file, content)
         .with_context(|| format!("failed to write {}", skill_file.display()))?;
 
-    println!("created skill: {}", skill_dir.display());
+    status("created skill:", skill_dir.display());
     Ok(())
 }
