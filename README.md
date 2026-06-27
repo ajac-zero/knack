@@ -153,8 +153,17 @@ knack install git+ssh://git@git.example.com/org/skills.git@main//path/to/skill
 Register a Git host alias in `knack.toml`:
 
 ```bash
-knack registry add tea git+ssh://git@gitea.example.com
+knack registry add git+ssh://git@gitea.example.com tea
 knack registry list
+```
+
+For HTTP knack registries the alias can be omitted — the CLI fetches
+`GET <url>/info` and adopts whatever name the registry advertises so
+every client of the same registry uses the same alias:
+
+```bash
+knack registry add http://127.0.0.1:7349           # adopts the advertised name
+knack registry add http://127.0.0.1:7349 myalias   # explicit override
 ```
 
 Then add skills through the alias:
@@ -230,7 +239,7 @@ With `--public-alias company`, search results return proxy install sources such 
 Register and search that registry from the CLI:
 
 ```bash
-knack registry add local http://127.0.0.1:7349
+knack registry add http://127.0.0.1:7349 local
 knack find pdf
 ```
 
@@ -288,7 +297,7 @@ knack-registry \
 Users still only need the HTTP registry:
 
 ```bash
-knack registry add company http://127.0.0.1:7349
+knack registry add http://127.0.0.1:7349       # adopts the advertised name `company`
 knack find deploy
 knack add company:deploy-container
 ```
@@ -296,7 +305,7 @@ knack add company:deploy-container
 Publish a local skill into a git-backed team skills repository:
 
 ```bash
-knack registry add tea git+ssh://git@gitea.example.com
+knack registry add git+ssh://git@gitea.example.com tea
 knack publish ./my-skill \
   --registry tea \
   --repo platform/agent-skills

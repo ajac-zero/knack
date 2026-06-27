@@ -211,14 +211,20 @@ enum RegistryCommand {
     /// The registry kind is inferred from the URL scheme: `git+ssh://` and
     /// `git+https://` are git-host registries; `http://` and `https://` are
     /// HTTP knack registries.
+    ///
+    /// `<name>` is optional for HTTP registries: when omitted, the CLI
+    /// fetches `GET <url>/info` and adopts the registry's advertised
+    /// name. Git-host registries always require an explicit `<name>`.
     Add {
-        /// Alias name, e.g. tea.
-        name: String,
-
         /// Base URL. Examples: `git+ssh://git@gitea.example.com`,
         /// `git+https://github.com`, `http://127.0.0.1:7349`,
         /// `https://knack.example.com`.
         url: String,
+
+        /// Local alias name, e.g. tea. When omitted and the URL points to
+        /// an HTTP registry, the name is read from the registry's /info
+        /// endpoint so every client of the registry adopts the same alias.
+        name: Option<String>,
 
         /// Default Git ref for git-host registries. Ignored for HTTP
         /// registries.
@@ -276,6 +282,59 @@ fn infer_registry_kind(url: &str) -> Result<RegistryKind> {
              expected a scheme of `git+ssh://`, `git+https://`, `http://`, or `https://`"
         );
     }
+}
+
+/// Resolve the local alias name for a new registry. If the user passed an
+/// explicit name we use it. Otherwise, for HTTP registries we fetch
+/// `GET <url>/info` and adopt whatever name the registry advertises —
+/// this gives parity across clients without anyone having to coordinate
+/// out of band. Git-host registries don't have an `/info` endpoint, so
+/// the name remains required for them.
+fn resolve_registry_name(
+    provided: Option<String>,
+    url: &str,
+    kind: RegistryKind,
+) -> Result<String> {
+    if let Some(name) = provided {
+        return Ok(name);
+    }
+    match kind {
+        RegistryKind::Http => fetch_advertised_registry_name(url),
+        RegistryKind::GitHost => bail!(
+            "git-host registries don't advertise a name; \
+             pass an explicit alias as the second argument, e.g. \
+             `knack registry add {url} <name>`"
+        ),
+    }
+}
+
+/// Fetch GET <base>/info and return the advertised name. Errors loudly
+/// when the registry didn't set one — there's no sensible default we
+/// can pick on the user's behalf.
+fn fetch_advertised_registry_name(base_url: &str) -> Result<String> {
+    let base = base_url.trim_end_matches('/');
+    let info_url = format!("{base}/info");
+    let response = reqwest::blocking::Client::new()
+        .get(&info_url)
+        .header(reqwest::header::USER_AGENT, "knack")
+        .send()
+        .with_context(|| format!("failed to fetch {info_url}"))?
+        .error_for_status()
+        .with_context(|| format!("registry returned an error for {info_url}"))?;
+    #[derive(serde::Deserialize)]
+    struct RegistryInfo {
+        name: Option<String>,
+    }
+    let info: RegistryInfo = response
+        .json()
+        .with_context(|| format!("failed to parse {info_url} as RegistryInfo JSON"))?;
+    info.name.ok_or_else(|| {
+        anyhow!(
+            "registry at {base_url} doesn't advertise a name; \
+             pass an explicit alias as the second argument, e.g. \
+             `knack registry add {base_url} <name>`"
+        )
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -452,8 +511,8 @@ fn main() -> Result<()> {
 fn handle_registry_command(command: RegistryCommand) -> Result<()> {
     match command {
         RegistryCommand::Add {
-            name,
             url,
+            name,
             default_ref,
             manifest,
             global,
@@ -462,9 +521,10 @@ fn handle_registry_command(command: RegistryCommand) -> Result<()> {
             let manifest_path = resolve_manifest_path(manifest, scope)?;
             let default_target = scope.install_target()?;
             let kind = infer_registry_kind(&url)?;
+            let resolved_name = resolve_registry_name(name, &url, kind)?;
             registry_add(
                 &manifest_path,
-                &name,
+                &resolved_name,
                 RegistryConfig {
                     kind,
                     url,
