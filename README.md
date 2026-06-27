@@ -60,12 +60,12 @@ By default, commands use project scope:
 .agents/skills/
 ```
 
-Use global scope for user-wide skills. `knack add` creates the manifest on first use, so an explicit `knack init` is only needed if you want to customize the install target:
+Pass `-g` (or `--global`) on any command to operate on user-wide skills instead of the current project. `knack add` creates the manifest on first use, so an explicit `knack init` is only needed if you want to customize the install target:
 
 ```bash
-knack add gh:anthropics/skills/skills/pdf --scope global
-knack sync --scope global
-knack list --scope global
+knack add gh:anthropics/skills/skills/pdf -g
+knack sync -g
+knack list -g
 ```
 
 Global scope uses:
@@ -76,20 +76,14 @@ Global scope uses:
 ~/.agents/skills/
 ```
 
-Admins can provide system-wide defaults with system scope:
-
-```bash
-knack init --scope system
-knack registry add tea git+ssh://git@gitea.example.com --scope system
-```
-
-System scope uses:
+System-wide defaults are configured at:
 
 ```text
 /etc/knack/knack.toml
-/etc/knack/knack.lock
 /usr/local/share/knack/skills/
 ```
+
+These have no dedicated CLI flag because they are an administrator concern. Edit `/etc/knack/knack.toml` directly (with `sudo`) to seed registry aliases that every user on the machine should inherit.
 
 Registry aliases are inherited in this order, with later layers overriding earlier layers:
 

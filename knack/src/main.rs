@@ -38,9 +38,9 @@ enum Command {
         #[arg(long)]
         target: Option<PathBuf>,
 
-        /// Configuration scope to initialize.
-        #[arg(long, value_enum, default_value_t = Scope::Project)]
-        scope: Scope,
+        /// Initialize the global manifest (~/.config/knack/knack.toml) instead of the current project's .agents/knack.toml.
+        #[arg(short = 'g', long)]
+        global: bool,
     },
 
     /// Install a skill source and record it in the project manifest.
@@ -52,9 +52,9 @@ enum Command {
         #[arg(long)]
         manifest: Option<PathBuf>,
 
-        /// Configuration scope to use when --manifest is not provided.
-        #[arg(long, value_enum, default_value_t = Scope::Project)]
-        scope: Scope,
+        /// Use global scope (~/.config/knack/) instead of the current project.
+        #[arg(short = 'g', long)]
+        global: bool,
     },
 
     /// Install all skills declared in the project manifest.
@@ -63,9 +63,9 @@ enum Command {
         #[arg(long)]
         manifest: Option<PathBuf>,
 
-        /// Configuration scope to use when --manifest is not provided.
-        #[arg(long, value_enum, default_value_t = Scope::Project)]
-        scope: Scope,
+        /// Use global scope (~/.config/knack/) instead of the current project.
+        #[arg(short = 'g', long)]
+        global: bool,
     },
 
     /// Find skills to install from configured registries.
@@ -77,9 +77,9 @@ enum Command {
         #[arg(long)]
         manifest: Option<PathBuf>,
 
-        /// Configuration scope to use when --manifest is not provided.
-        #[arg(long, value_enum, default_value_t = Scope::Project)]
-        scope: Scope,
+        /// Use global scope (~/.config/knack/) instead of the current project.
+        #[arg(short = 'g', long)]
+        global: bool,
     },
 
     /// Publish a skill to a git-backed skill repository.
@@ -103,9 +103,9 @@ enum Command {
         #[arg(long)]
         manifest: Option<PathBuf>,
 
-        /// Configuration scope to use when --manifest is not provided.
-        #[arg(long, value_enum, default_value_t = Scope::Project)]
-        scope: Scope,
+        /// Use global scope (~/.config/knack/) instead of the current project.
+        #[arg(short = 'g', long)]
+        global: bool,
 
         /// Do not push the generated commit.
         #[arg(long)]
@@ -159,9 +159,9 @@ enum Command {
         #[arg(long)]
         target: Option<PathBuf>,
 
-        /// Install target scope to use when --target is not provided.
-        #[arg(long, value_enum, default_value_t = Scope::Project)]
-        scope: Scope,
+        /// Install into the global skill directory (~/.agents/skills/) instead of the current project's .agents/skills/.
+        #[arg(short = 'g', long)]
+        global: bool,
     },
 
     /// List installed skills.
@@ -170,9 +170,9 @@ enum Command {
         #[arg(long)]
         target: Option<PathBuf>,
 
-        /// List target scope to use when --target is not provided.
-        #[arg(long, value_enum, default_value_t = Scope::Project)]
-        scope: Scope,
+        /// List skills installed in the global directory (~/.agents/skills/) instead of the current project's .agents/skills/.
+        #[arg(short = 'g', long)]
+        global: bool,
     },
 }
 
@@ -215,9 +215,9 @@ enum RegistryCommand {
         #[arg(long)]
         manifest: Option<PathBuf>,
 
-        /// Configuration scope to use when --manifest is not provided.
-        #[arg(long, value_enum, default_value_t = Scope::Project)]
-        scope: Scope,
+        /// Use global scope (~/.config/knack/) instead of the current project.
+        #[arg(short = 'g', long)]
+        global: bool,
     },
 
     /// List registry aliases.
@@ -226,9 +226,9 @@ enum RegistryCommand {
         #[arg(long)]
         manifest: Option<PathBuf>,
 
-        /// Configuration scope to use when --manifest is not provided.
-        #[arg(long, value_enum, default_value_t = Scope::Project)]
-        scope: Scope,
+        /// Use global scope (~/.config/knack/) instead of the current project.
+        #[arg(short = 'g', long)]
+        global: bool,
     },
 
     /// Remove a registry alias.
@@ -240,9 +240,9 @@ enum RegistryCommand {
         #[arg(long)]
         manifest: Option<PathBuf>,
 
-        /// Configuration scope to use when --manifest is not provided.
-        #[arg(long, value_enum, default_value_t = Scope::Project)]
-        scope: Scope,
+        /// Use global scope (~/.config/knack/) instead of the current project.
+        #[arg(short = 'g', long)]
+        global: bool,
     },
 }
 
@@ -261,7 +261,7 @@ impl From<RegistryKindArg> for RegistryKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug)]
 enum Scope {
     Project,
     Global,
@@ -269,6 +269,14 @@ enum Scope {
 }
 
 impl Scope {
+    /// Convert a CLI `-g`/`--global` boolean into a Scope. System scope is not
+    /// exposed through any per-command flag: admins edit /etc/knack/knack.toml
+    /// directly, and the layered registry inheritance in effective_registries
+    /// reads it from there.
+    fn from_global_flag(global: bool) -> Self {
+        if global { Self::Global } else { Self::Project }
+    }
+
     fn manifest_path(self) -> Result<PathBuf> {
         match self {
             Self::Project => Ok(PathBuf::from(".agents/knack.toml")),
@@ -352,8 +360,9 @@ fn main() -> Result<()> {
         Command::Init {
             manifest,
             target,
-            scope,
+            global,
         } => {
+            let scope = Scope::from_global_flag(global);
             let manifest = resolve_manifest_path(manifest, scope)?;
             let target = resolve_target_path(target, scope)?;
             init_manifest(&manifest, &target)?;
@@ -361,21 +370,24 @@ fn main() -> Result<()> {
         Command::Add {
             source,
             manifest,
-            scope,
+            global,
         } => {
+            let scope = Scope::from_global_flag(global);
             let manifest = resolve_manifest_path(manifest, scope)?;
             let default_target = scope.install_target()?;
             add_skill(&manifest, &source, &default_target)?;
         }
-        Command::Sync { manifest, scope } => {
+        Command::Sync { manifest, global } => {
+            let scope = Scope::from_global_flag(global);
             let manifest = resolve_manifest_path(manifest, scope)?;
             sync_skills(&manifest)?;
         }
         Command::Find {
             query,
             manifest,
-            scope,
+            global,
         } => {
+            let scope = Scope::from_global_flag(global);
             let manifest = resolve_manifest_path(manifest, scope)?;
             find_registry_skills(&manifest, &query)?;
         }
@@ -385,9 +397,10 @@ fn main() -> Result<()> {
             repo,
             skills_dir,
             manifest,
-            scope,
+            global,
             no_push,
         } => {
+            let scope = Scope::from_global_flag(global);
             let manifest = resolve_manifest_path(manifest, scope)?;
             publish_skill(&manifest, &path, &registry, &repo, &skills_dir, no_push)?;
         }
@@ -412,13 +425,15 @@ fn main() -> Result<()> {
         Command::Install {
             source,
             target,
-            scope,
+            global,
         } => {
+            let scope = Scope::from_global_flag(global);
             let target = resolve_target_path(target, scope)?;
             let installed = install_skill(&source, &target)?;
             status("installed skill:", installed.path.display());
         }
-        Command::List { target, scope } => {
+        Command::List { target, global } => {
+            let scope = Scope::from_global_flag(global);
             let target = resolve_target_path(target, scope)?;
             list_skills(&target)?;
         }
@@ -435,8 +450,9 @@ fn handle_registry_command(command: RegistryCommand) -> Result<()> {
             kind,
             default_ref,
             manifest,
-            scope,
+            global,
         } => {
+            let scope = Scope::from_global_flag(global);
             let manifest_path = resolve_manifest_path(manifest, scope)?;
             registry_add(
                 &manifest_path,
@@ -448,15 +464,17 @@ fn handle_registry_command(command: RegistryCommand) -> Result<()> {
                 },
             )?;
         }
-        RegistryCommand::List { manifest, scope } => {
+        RegistryCommand::List { manifest, global } => {
+            let scope = Scope::from_global_flag(global);
             let manifest_path = resolve_manifest_path(manifest, scope)?;
             registry_list(&manifest_path)?;
         }
         RegistryCommand::Remove {
             name,
             manifest,
-            scope,
+            global,
         } => {
+            let scope = Scope::from_global_flag(global);
             let manifest_path = resolve_manifest_path(manifest, scope)?;
             registry_remove(&manifest_path, &name)?;
         }
