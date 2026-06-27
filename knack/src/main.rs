@@ -1243,7 +1243,25 @@ fn fetch_github_skill(spec: &str) -> Result<FetchedSkill> {
         .get(&archive_url)
         .header(reqwest::header::USER_AGENT, "knack")
         .send()
-        .with_context(|| format!("failed to fetch {archive_url}"))?
+        .with_context(|| format!("failed to fetch {archive_url}"))?;
+
+    // Translate 404 into an actionable diagnostic. GitHub serves 404 for
+    // any missing piece: the owner, the repo, the ref, or the path within
+    // the repo. We can't tell which from the archive URL alone, so name
+    // the three usual suspects rather than blaming one specifically.
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        bail!(
+            "GitHub returned 404 for {}/{} at ref `{}`; \
+             check that the owner, repo, and ref exist and are public, \
+             or that the skill path within the repo is correct ({})",
+            spec.owner,
+            spec.repo,
+            spec.reference,
+            archive_url,
+        );
+    }
+
+    let response = response
         .error_for_status()
         .with_context(|| format!("GitHub returned an error for {archive_url}"))?;
 
