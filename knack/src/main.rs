@@ -721,7 +721,7 @@ fn unknown_registry_hint(
 ) -> String {
     if registries.is_empty() {
         "no registries are configured; register one with \
-         `knack registry add <name> <url>`"
+         `knack registry add <url> [<name>]`"
             .to_string()
     } else {
         let known: Vec<&str> = registries.keys().map(String::as_str).collect();
@@ -855,7 +855,7 @@ fn publish_skill(
         RegistryKind::Http => bail!(
             "registry `{registry_name}` is configured as `http`, but \
              `knack publish` only supports git-host registries; register \
-             a git-host registry with `knack registry add <name> git+ssh://...` \
+             a git-host registry with `knack registry add git+ssh://... <name>` \
              and pass that alias to `--registry`"
         ),
     }
