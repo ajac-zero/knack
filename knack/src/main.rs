@@ -1140,11 +1140,46 @@ fn install_http_skill_archive(url: &str, target: &Path) -> Result<InstalledSkill
         .get(url)
         .header(reqwest::header::USER_AGENT, "knack")
         .send()
-        .with_context(|| format!("failed to download {url}"))?
+        .with_context(|| format!("failed to download {url}"))?;
+
+    // Translate 404 into an actionable diagnostic. The HTTP knack URL
+    // produced by resolve_http_alias has the shape
+    // `http://...../skills/<name>/archive`, so we can usually recover
+    // the skill name and point the user at `knack find` for discovery.
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        let hint = match extract_archive_skill_name(url) {
+            Some(name) => format!(
+                "skill `{name}` not found on the registry; \
+                 try `knack find {name}` to look for related skills"
+            ),
+            None => "the registry has no skill at that URL; \
+                     try `knack find <query>` to discover skills"
+                .to_string(),
+        };
+        bail!("{hint} ({url})");
+    }
+
+    let response = response
         .error_for_status()
         .with_context(|| format!("registry returned an error for {url}"))?;
     let bytes = response.bytes().context("failed to read skill archive")?;
     install_archive_reader(flate2::read::GzDecoder::new(Cursor::new(bytes)), target)
+}
+
+/// Recover the skill name from an HTTP knack archive URL of the shape
+/// `<base>/skills/<name>/archive`. Returns None for any other shape so the
+/// caller can fall back to a generic hint instead of producing nonsense.
+fn extract_archive_skill_name(url: &str) -> Option<&str> {
+    let trimmed = url.strip_suffix("/archive")?;
+    let name = trimmed.rsplit('/').next()?;
+    let prefix = trimmed.strip_suffix(name)?.strip_suffix('/')?;
+    if !prefix.ends_with("/skills") {
+        return None;
+    }
+    if name.is_empty() {
+        return None;
+    }
+    Some(name)
 }
 
 fn install_archive_reader<R: std::io::Read>(reader: R, target: &Path) -> Result<InstalledSkill> {
