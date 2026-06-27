@@ -165,14 +165,16 @@ enum Command {
     },
 
     /// List installed skills.
+    ///
+    /// Shows skills from both the current project (.agents/skills/) and the
+    /// user's global directory (~/.agents/skills/) as separate sections.
+    /// Empty sections are suppressed. Pass --target to inspect a specific
+    /// directory instead.
     List {
-        /// Directory containing installed skills.
+        /// Inspect a specific skill directory instead of the default project
+        /// and global directories.
         #[arg(long)]
         target: Option<PathBuf>,
-
-        /// List skills installed in the global directory (~/.agents/skills/) instead of the current project's .agents/skills/.
-        #[arg(short = 'g', long)]
-        global: bool,
     },
 }
 
@@ -421,10 +423,8 @@ fn main() -> Result<()> {
             let installed = install_skill(&source, &target)?;
             status("installed skill:", installed.path.display());
         }
-        Command::List { target, global } => {
-            let scope = Scope::from_global_flag(global);
-            let target = resolve_target_path(target, scope)?;
-            list_skills(&target)?;
+        Command::List { target } => {
+            list_skills(target.as_deref())?;
         }
     }
 
@@ -1282,9 +1282,41 @@ fn install_skill_dir(source: &Path, target: &Path) -> Result<InstalledSkill> {
     })
 }
 
-fn list_skills(target: &PathBuf) -> Result<()> {
-    if !target.exists() {
+fn list_skills(explicit_target: Option<&Path>) -> Result<()> {
+    if let Some(target) = explicit_target {
+        let skills = collect_installed_skills(target)?;
+        print_skill_names(&skills);
         return Ok(());
+    }
+
+    let project_target = Scope::Project.install_target()?;
+    let global_target = Scope::Global.install_target()?;
+    let project_skills = collect_installed_skills(&project_target)?;
+    let global_skills = collect_installed_skills(&global_target)?;
+
+    if project_skills.is_empty() && global_skills.is_empty() {
+        notice("no skills installed");
+        return Ok(());
+    }
+
+    let mut printed_section = false;
+    if !project_skills.is_empty() {
+        print_skills_section("project", &project_target, &project_skills);
+        printed_section = true;
+    }
+    if !global_skills.is_empty() {
+        if printed_section {
+            anstream::println!();
+        }
+        print_skills_section("global", &global_target, &global_skills);
+    }
+
+    Ok(())
+}
+
+fn collect_installed_skills(target: &Path) -> Result<Vec<String>> {
+    if !target.exists() {
+        return Ok(Vec::new());
     }
 
     let mut skills = Vec::new();
@@ -1301,12 +1333,27 @@ fn list_skills(target: &PathBuf) -> Result<()> {
     }
 
     skills.sort();
+    Ok(skills)
+}
+
+fn print_skill_names(skills: &[String]) {
+    let skill_style = accent_style();
     for skill in skills {
-        let skill_style = accent_style();
         anstream::println!("{skill_style}{skill}{skill_style:#}");
     }
+}
 
-    Ok(())
+fn print_skills_section(label: &str, target: &Path, skills: &[String]) {
+    let heading_style = label_style();
+    let path_style = label_style();
+    let skill_style = accent_style();
+    anstream::println!(
+        "{heading_style}{label}{heading_style:#} {path_style}({}){path_style:#}",
+        target.display()
+    );
+    for name in skills {
+        anstream::println!("  {skill_style}{name}{skill_style:#}");
+    }
 }
 
 fn copy_dir(source: &Path, destination: &Path) -> Result<()> {
