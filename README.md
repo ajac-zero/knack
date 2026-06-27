@@ -112,14 +112,32 @@ reproducible):
 knack sync
 ```
 
-Pull upstream changes for skills tracking a moving ref (branch, tag).
-Sources pinned to a SHA-shaped ref are skipped — pass `-f` / `--force`
-to retry them anyway:
+For CI: verify the install and lockfile are consistent with the
+manifest without modifying anything. Exits non-zero with an actionable
+message on missing lockfile entries, missing installs, or checksum
+drift:
 
 ```bash
-knack update           # branch/tag-tracking skills get refreshed
-knack update --force   # ignore pinning, re-fetch everything
+knack sync --check
 ```
+
+Pull upstream changes for skills tracking a moving ref (branch, tag).
+Sources pinned to a SHA-shaped ref are skipped — pass `-f` / `--force`
+to retry them anyway. Pass `-n` / `--dry-run` to preview what would
+change without touching the install dir or lockfile (still fetches
+from the network so the preview is accurate):
+
+```bash
+knack update              # branch/tag-tracking skills get refreshed
+knack update --dry-run    # report what would change; modify nothing
+knack update --force      # ignore pinning, re-fetch everything
+```
+
+The lockfile records each skill's `resolved` source as a
+content-addressed commit SHA — `gh:` and `git+` URLs embed `@<sha>`,
+`http+knack:` URLs append `#sha=<sha>`. That makes `knack sync` truly
+reproducible: a teammate cloning the repo six months later installs
+the same commits, regardless of where `main` has moved since.
 
 Validate a skill:
 
@@ -218,7 +236,7 @@ The image defaults to:
 knack-registry \
   --index /data/knack.index.toml \
   --skills-root /data/skills \
-  --public-alias company \
+  --name company \
   --bind 0.0.0.0:7349
 ```
 
@@ -230,7 +248,7 @@ docker run --rm -p 7349:7349 \
   knack-registry \
   --index /data/knack.index.toml \
   --skills-root /data/skills \
-  --public-alias platform \
+  --name platform \
   --bind 0.0.0.0:7349
 ```
 
@@ -240,11 +258,13 @@ To make the HTTP registry the only thing users need to interact with, serve skil
 knack-registry \
   --index knack.index.toml \
   --skills-root ./skills \
-  --public-alias company \
+  --name company \
   --bind 127.0.0.1:7349
 ```
 
-With `--public-alias company`, search results return proxy install sources such as `company:deploy-container`. The CLI resolves those through the HTTP registry and downloads the skill archive from the registry server.
+With `--name company`, search results return proxy install sources such as `company:deploy-container`. The CLI resolves those through the HTTP registry and downloads the skill archive from the registry server. The registry also advertises the name at `GET /info` so clients can `knack registry add <url>` without supplying an alias.
+
+When a skill's backing source is a git repository, the registry includes the resolved commit SHA in the archive response via the `X-Knack-Resolved-Sha` header. The CLI captures it into the lockfile so HTTP-registry installs are pinned the same way `gh:`/`git+` installs are.
 
 Register and search that registry from the CLI:
 
@@ -298,7 +318,7 @@ Start the registry with a source alias so it can fetch those backing sources ser
 ```bash
 knack-registry \
   --index knack.index.toml \
-  --public-alias company \
+  --name company \
   --source-alias tea=git+ssh://git@gitea.example.com \
   --refresh-interval-seconds 300 \
   --bind 127.0.0.1:7349
@@ -357,11 +377,16 @@ Implemented:
 - Project and global scoped config/install paths.
 - System scoped config at `/etc/knack/knack.toml`.
 - Layered registry alias inheritance from system to global to project.
-- `add` and `sync` workflows for reproducible project installs.
+- `add`, `sync`, and `update` workflows for reproducible project installs.
+- Content-addressed lockfile entries (commit SHA captured for `gh:`,
+  `git+`, and `http+knack:` sources).
+- `knack sync --check` for CI: assert install + lockfile consistency.
+- `knack update --dry-run` for previewing upstream changes.
+- Versioned lockfile schema; future-incompatible lockfiles refuse to
+  load rather than silently round-tripping.
 - Listing installed skills.
 
 Not implemented yet:
 
 - Static registries.
-- Locking GitHub branches and tags to immutable commit SHAs.
 - Signing, provenance, and policy checks.
