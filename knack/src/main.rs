@@ -443,6 +443,7 @@ fn handle_registry_command(command: RegistryCommand) -> Result<()> {
         } => {
             let scope = Scope::from_global_flag(global);
             let manifest_path = resolve_manifest_path(manifest, scope)?;
+            let default_target = scope.install_target()?;
             registry_add(
                 &manifest_path,
                 &name,
@@ -451,6 +452,7 @@ fn handle_registry_command(command: RegistryCommand) -> Result<()> {
                     url,
                     default_ref,
                 },
+                &default_target,
             )?;
         }
         RegistryCommand::List { manifest } => {
@@ -548,8 +550,14 @@ fn is_ignored_scan_dir(path: &Path) -> bool {
         .is_some_and(|name| matches!(name, ".git" | "target" | "node_modules"))
 }
 
-fn registry_add(manifest_path: &Path, name: &str, config: RegistryConfig) -> Result<()> {
+fn registry_add(
+    manifest_path: &Path,
+    name: &str,
+    config: RegistryConfig,
+    default_target: &Path,
+) -> Result<()> {
     validate_registry_name(name)?;
+    ensure_manifest_exists(manifest_path, default_target)?;
     let mut manifest = read_manifest(manifest_path)?;
     manifest.registries.insert(name.to_string(), config);
     write_manifest(manifest_path, &manifest)?;
