@@ -485,7 +485,10 @@ fn handle_index_command(command: IndexCommand) -> Result<()> {
             root,
             source_prefix,
             output,
-        } => generate_index(&root, &source_prefix, &output)?,
+        } => {
+            generate_index(&root, &source_prefix, &output)?;
+            status("generated index:", output.display());
+        }
     }
 
     Ok(())
@@ -522,7 +525,6 @@ fn generate_index(root: &Path, source_prefix: &str, output: &Path) -> Result<()>
     }
     let contents = toml::to_string_pretty(&index).context("failed to serialize index")?;
     fs::write(output, contents).with_context(|| format!("failed to write {}", output.display()))?;
-    status("generated index:", output.display());
     Ok(())
 }
 
