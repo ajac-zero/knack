@@ -1136,6 +1136,16 @@ fn sync_skills(manifest_path: &Path, update: bool) -> Result<()> {
     Ok(())
 }
 
+/// Returns true when the string is shaped like a git SHA. Used in two
+/// places: by fetch_git_skill to choose between a shallow `--branch`
+/// clone and a full clone + checkout, and (in a follow-up) by the
+/// sync loop to honor pinned refs. Tags like `v1.0` and branches like
+/// `main` deliberately do not match — they're mutable references and
+/// should not be treated as pinning evidence.
+fn looks_like_sha(s: &str) -> bool {
+    matches!(s.len(), 7..=40) && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 fn resolve_source_alias(source: &str, manifest: &Manifest) -> Result<String> {
     if source.starts_with("gh:") || source.starts_with("git+") || Path::new(source).exists() {
         return Ok(source.to_string());
@@ -1406,20 +1416,38 @@ fn fetch_git_skill(spec: &GitSourceSpec) -> Result<FetchedSkill> {
     let temp_dir = tempfile::tempdir().context("failed to create temporary directory")?;
     let repo_dir = temp_dir.path().join("repo");
     let repo_dir_str = repo_dir.to_str().unwrap_or_default();
-    let action = format!("clone {} at ref {}", spec.repo_url, spec.reference);
-    run_git(
-        [
-            "clone",
-            "--depth",
-            "1",
-            "--branch",
-            &spec.reference,
-            &spec.repo_url,
-            repo_dir_str,
-        ],
-        None,
-        &action,
-    )?;
+
+    if looks_like_sha(&spec.reference) {
+        // SHA refs need a full clone + checkout because `git clone
+        // --branch` only accepts branch and tag names, and `--depth 1`
+        // requires server-side allowReachableSHA1InWant which we can't
+        // assume across hosts. Slower than the shallow path, but always
+        // works.
+        let clone_action = format!("clone {} for SHA ref {}", spec.repo_url, spec.reference);
+        run_git(["clone", &spec.repo_url, repo_dir_str], None, &clone_action)?;
+        let checkout_action = format!("check out {} in {}", spec.reference, spec.repo_url);
+        run_git(
+            ["checkout", "--quiet", &spec.reference],
+            Some(&repo_dir),
+            &checkout_action,
+        )?;
+    } else {
+        // Branch or tag: shallow clone the named ref directly.
+        let action = format!("clone {} at ref {}", spec.repo_url, spec.reference);
+        run_git(
+            [
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                &spec.reference,
+                &spec.repo_url,
+                repo_dir_str,
+            ],
+            None,
+            &action,
+        )?;
+    }
 
     let skill_dir = repo_dir.join(&spec.skill_path);
     let skill = read_skill(&skill_dir).with_context(|| {
