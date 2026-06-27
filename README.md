@@ -230,7 +230,7 @@ With `--public-alias company`, search results return proxy install sources such 
 Register and search that registry from the CLI:
 
 ```bash
-knack registry add local http://127.0.0.1:7349 --kind http
+knack registry add local http://127.0.0.1:7349
 knack find pdf
 ```
 
@@ -288,7 +288,7 @@ knack-registry \
 Users still only need the HTTP registry:
 
 ```bash
-knack registry add company http://127.0.0.1:7349 --kind http
+knack registry add company http://127.0.0.1:7349
 knack find deploy
 knack add company:deploy-container
 ```

@@ -8,7 +8,7 @@ use std::{
 
 use anstyle::{AnsiColor, Effects, Style};
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use flate2::{Compression, write::GzEncoder};
 use knack_core::{
     IndexedSkill, LockedSkill, Lockfile, Manifest, RegistryConfig, RegistryIndex, RegistryKind,
@@ -198,18 +198,21 @@ enum IndexCommand {
 #[derive(Debug, Subcommand)]
 enum RegistryCommand {
     /// Add or update a registry alias.
+    ///
+    /// The registry kind is inferred from the URL scheme: `git+ssh://` and
+    /// `git+https://` are git-host registries; `http://` and `https://` are
+    /// HTTP knack registries.
     Add {
         /// Alias name, e.g. tea.
         name: String,
 
-        /// Base URL, e.g. git+ssh://git@gitea.example.com.
+        /// Base URL. Examples: `git+ssh://git@gitea.example.com`,
+        /// `git+https://github.com`, `http://127.0.0.1:7349`,
+        /// `https://knack.example.com`.
         url: String,
 
-        /// Registry backend type.
-        #[arg(long, value_enum, default_value_t = RegistryKindArg::GitHost)]
-        kind: RegistryKindArg,
-
-        /// Default Git ref for git-host registries.
+        /// Default Git ref for git-host registries. Ignored for HTTP
+        /// registries.
         #[arg(long, default_value = "main")]
         default_ref: String,
 
@@ -249,18 +252,20 @@ enum RegistryCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum RegistryKindArg {
-    GitHost,
-    Http,
-}
-
-impl From<RegistryKindArg> for RegistryKind {
-    fn from(kind: RegistryKindArg) -> Self {
-        match kind {
-            RegistryKindArg::GitHost => Self::GitHost,
-            RegistryKindArg::Http => Self::Http,
-        }
+/// Infer the registry backend kind from the URL scheme. `git+` URLs are
+/// git-host registries; `http(s)://` URLs are HTTP knack registries. Any
+/// other scheme is an error so users get an actionable diagnostic instead
+/// of a silently wrong configuration.
+fn infer_registry_kind(url: &str) -> Result<RegistryKind> {
+    if url.starts_with("git+") {
+        Ok(RegistryKind::GitHost)
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        Ok(RegistryKind::Http)
+    } else {
+        bail!(
+            "cannot determine registry kind from URL `{url}`; \
+             expected a scheme of `git+ssh://`, `git+https://`, `http://`, or `https://`"
+        );
     }
 }
 
@@ -436,7 +441,6 @@ fn handle_registry_command(command: RegistryCommand) -> Result<()> {
         RegistryCommand::Add {
             name,
             url,
-            kind,
             default_ref,
             manifest,
             global,
@@ -444,11 +448,12 @@ fn handle_registry_command(command: RegistryCommand) -> Result<()> {
             let scope = Scope::from_global_flag(global);
             let manifest_path = resolve_manifest_path(manifest, scope)?;
             let default_target = scope.install_target()?;
+            let kind = infer_registry_kind(&url)?;
             registry_add(
                 &manifest_path,
                 &name,
                 RegistryConfig {
-                    kind: kind.into(),
+                    kind,
                     url,
                     default_ref,
                 },
