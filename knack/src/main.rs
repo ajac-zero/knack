@@ -1072,12 +1072,17 @@ fn add_skill(manifest_path: &Path, source: &str, default_target: &Path) -> Resul
     manifest
         .skills
         .insert(installed.name.clone(), source.to_string());
+    let locked_resolved = installed
+        .resolved_sha
+        .as_deref()
+        .and_then(|sha| pin_resolved_with_sha(&resolved_source, sha))
+        .unwrap_or(resolved_source);
     upsert_lock(
         &mut lockfile,
         LockedSkill {
             name: installed.name.clone(),
             source: source.to_string(),
-            resolved: resolved_source,
+            resolved: locked_resolved,
             checksum: checksum_dir(&installed.path)?,
         },
     );
@@ -1121,12 +1126,17 @@ fn sync_skills(manifest_path: &Path) -> Result<()> {
             .unwrap_or_else(|| resolve_source_alias(source, &manifest))?;
 
         let installed = install_skill(&resolved, &manifest.install.target)?;
+        let locked_resolved = installed
+            .resolved_sha
+            .as_deref()
+            .and_then(|sha| pin_resolved_with_sha(&resolved, sha))
+            .unwrap_or(resolved);
         upsert_lock(
             &mut lockfile,
             LockedSkill {
                 name: installed.name.clone(),
                 source: source.clone(),
-                resolved,
+                resolved: locked_resolved,
                 checksum: checksum_dir(&installed.path)?,
             },
         );
@@ -1177,12 +1187,17 @@ fn update_skills(manifest_path: &Path, force: bool) -> Result<()> {
 
         let installed = install_skill(&resolved, &manifest.install.target)?;
         let new_checksum = checksum_dir(&installed.path)?;
+        let locked_resolved = installed
+            .resolved_sha
+            .as_deref()
+            .and_then(|sha| pin_resolved_with_sha(&resolved, sha))
+            .unwrap_or(resolved);
         upsert_lock(
             &mut lockfile,
             LockedSkill {
                 name: installed.name.clone(),
                 source: source.clone(),
-                resolved,
+                resolved: locked_resolved,
                 checksum: new_checksum.clone(),
             },
         );
@@ -1232,6 +1247,28 @@ fn extract_source_ref(source: &str) -> Option<String> {
     }
     if source.starts_with("git+") {
         return parse_git_source(source).ok().map(|s| s.reference);
+    }
+    None
+}
+
+/// Rewrite a resolved source string to embed a content-addressed
+/// commit SHA. The lockfile uses the rewritten form so `knack sync`
+/// reinstalls from the exact commit a teammate had — even when the
+/// manifest source points at a moving ref like `main`.
+///
+/// Returns None when the source's scheme has no SHA concept
+/// (http+knack:, local paths) or when the source is malformed; the
+/// caller falls back to the unpinned resolved string in that case.
+fn pin_resolved_with_sha(resolved: &str, sha: &str) -> Option<String> {
+    if let Some(spec_str) = resolved.strip_prefix("gh:") {
+        let spec = parse_github_spec(spec_str).ok()?;
+        let path = spec.skill_path.to_string_lossy().replace('\\', "/");
+        return Some(format!("gh:{}/{}@{sha}/{path}", spec.owner, spec.repo));
+    }
+    if resolved.starts_with("git+") {
+        let spec = parse_git_source(resolved).ok()?;
+        let path = spec.skill_path.to_string_lossy().replace('\\', "/");
+        return Some(format!("git+{}@{sha}//{path}", spec.repo_url));
     }
     None
 }
@@ -1325,6 +1362,11 @@ fn is_skill_installed(name: &str, target: &Path) -> bool {
 struct InstalledSkill {
     name: String,
     path: PathBuf,
+    /// SHA captured from the upstream repository when available (gh:
+    /// and git+ paths only). Used to rewrite the lockfile's `resolved`
+    /// field into a content-addressed form so peers get the same
+    /// commit on `knack sync`.
+    resolved_sha: Option<String>,
 }
 
 fn install_skill(source: &str, target: &PathBuf) -> Result<InstalledSkill> {
@@ -1332,13 +1374,17 @@ fn install_skill(source: &str, target: &PathBuf) -> Result<InstalledSkill> {
 
     if let Some(spec) = source.strip_prefix("gh:") {
         let fetched = fetch_github_skill(spec)?;
-        return install_skill_dir(&fetched.path, target);
+        let mut installed = install_skill_dir(&fetched.path, target)?;
+        installed.resolved_sha = fetched.resolved_sha;
+        return Ok(installed);
     }
 
     if source.starts_with("git+") {
         let spec = parse_git_source(source)?;
         let fetched = fetch_git_skill(&spec)?;
-        return install_skill_dir(&fetched.path, target);
+        let mut installed = install_skill_dir(&fetched.path, target)?;
+        installed.resolved_sha = fetched.resolved_sha;
+        return Ok(installed);
     }
 
     if let Some(url) = source.strip_prefix("http+knack:") {
@@ -1434,6 +1480,11 @@ struct GithubSpec {
 struct FetchedSkill {
     path: PathBuf,
     _temp_dir: TempDir,
+    /// Full commit SHA the fetch ended up at, when discoverable.
+    /// For gh: it comes from the archive's root directory name
+    /// (`<repo>-<sha>/`); for git+ from `git rev-parse HEAD` after
+    /// clone/checkout. None for archive shapes that don't expose a SHA.
+    resolved_sha: Option<String>,
 }
 
 fn fetch_github_skill(spec: &str) -> Result<FetchedSkill> {
@@ -1480,6 +1531,17 @@ fn fetch_github_skill(spec: &str) -> Result<FetchedSkill> {
         .context("failed to unpack GitHub archive")?;
 
     let repo_root = single_child_dir(temp_dir.path())?;
+    // GitHub's archive tarballs unpack to `<repo>-<sha>/` regardless of
+    // whether the ref was a branch, tag, or SHA. Pull the SHA out for
+    // the lockfile. Only accept SHA-shaped suffixes so a future change
+    // to GitHub's naming (e.g. `<repo>-<tag>/`) doesn't quietly write
+    // garbage into the lock.
+    let resolved_sha = repo_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(&format!("{}-", spec.repo)))
+        .filter(|suffix| looks_like_sha(suffix))
+        .map(String::from);
     let skill_dir = repo_root.join(&spec.skill_path);
     let skill = read_skill(&skill_dir).with_context(|| {
         format!(
@@ -1492,6 +1554,7 @@ fn fetch_github_skill(spec: &str) -> Result<FetchedSkill> {
     Ok(FetchedSkill {
         path: skill_dir,
         _temp_dir: temp_dir,
+        resolved_sha,
     })
 }
 
@@ -1539,6 +1602,12 @@ fn fetch_git_skill(spec: &GitSourceSpec) -> Result<FetchedSkill> {
         )?;
     }
 
+    // Capture the SHA we ended up at so the lockfile can pin to
+    // content rather than a moving ref. For a SHA-shaped ref this is
+    // redundant (the ref *is* the SHA), but we capture uniformly so
+    // branches and tags also get pinned in the lockfile.
+    let resolved_sha = capture_git_head_sha(&repo_dir).ok();
+
     let skill_dir = repo_dir.join(&spec.skill_path);
     let skill = read_skill(&skill_dir).with_context(|| {
         format!(
@@ -1551,7 +1620,30 @@ fn fetch_git_skill(spec: &GitSourceSpec) -> Result<FetchedSkill> {
     Ok(FetchedSkill {
         path: skill_dir,
         _temp_dir: temp_dir,
+        resolved_sha,
     })
+}
+
+/// Run `git rev-parse HEAD` in `repo_dir` and return the full
+/// 40-char SHA. Returns Err on any failure (missing git, detached
+/// state weirdness, etc.); callers treat that as 'no SHA available'.
+fn capture_git_head_sha(repo_dir: &Path) -> Result<String> {
+    let output = ProcessCommand::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .context("failed to invoke git rev-parse HEAD")?;
+    if !output.status.success() {
+        bail!("git rev-parse HEAD failed");
+    }
+    let sha = String::from_utf8(output.stdout)
+        .context("git rev-parse HEAD returned non-UTF-8")?
+        .trim()
+        .to_string();
+    if !looks_like_sha(&sha) {
+        bail!("git rev-parse HEAD returned a non-SHA-shaped value: {sha}");
+    }
+    Ok(sha)
 }
 
 fn parse_git_source(source: &str) -> Result<GitSourceSpec> {
@@ -1658,6 +1750,7 @@ fn install_skill_dir(source: &Path, target: &Path) -> Result<InstalledSkill> {
     Ok(InstalledSkill {
         name: skill.name,
         path: destination,
+        resolved_sha: None,
     })
 }
 
