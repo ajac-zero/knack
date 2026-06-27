@@ -69,9 +69,18 @@ enum Command {
         /// Re-resolve and reinstall every skill, ignoring the lockfile's
         /// previously resolved sources. Useful when a skill's source
         /// points at a moving ref (e.g. a branch) and the upstream
-        /// content has changed.
+        /// content has changed. Sources pinned to a SHA-shaped ref are
+        /// skipped — pass --force to override.
         #[arg(short = 'U', long)]
         update: bool,
+
+        /// Re-resolve and reinstall sources that --update would otherwise
+        /// skip because their ref is SHA-shaped (and therefore immutable).
+        /// Useful when a force-push has rewritten history under a SHA you
+        /// previously installed, or when you just want to retry the
+        /// install. Requires --update.
+        #[arg(short = 'f', long, requires = "update")]
+        force: bool,
     },
 
     /// Find skills to install from configured registries.
@@ -451,10 +460,11 @@ fn main() -> Result<()> {
             manifest,
             global,
             update,
+            force,
         } => {
             let scope = Scope::from_global_flag(global);
             let manifest = resolve_manifest_path(manifest, scope)?;
-            sync_skills(&manifest, update)?;
+            sync_skills(&manifest, update, force)?;
         }
         Command::Find { query, manifest } => {
             find_registry_skills(manifest.as_deref(), &query)?;
@@ -1066,7 +1076,7 @@ fn add_skill(manifest_path: &Path, source: &str, default_target: &Path) -> Resul
     Ok(())
 }
 
-fn sync_skills(manifest_path: &Path, update: bool) -> Result<()> {
+fn sync_skills(manifest_path: &Path, update: bool, force: bool) -> Result<()> {
     let manifest = read_manifest(manifest_path)?;
     let lockfile_path = lockfile_path_for(manifest_path);
     let mut lockfile = read_lockfile(&lockfile_path)?;
@@ -1095,6 +1105,15 @@ fn sync_skills(manifest_path: &Path, update: bool) -> Result<()> {
                 .map(Ok)
                 .unwrap_or_else(|| resolve_source_alias(source, &manifest))?
         };
+
+        // Honor pinned refs on --update: a source pinned to a SHA-shaped
+        // ref is content-addressed and re-fetching can't produce a
+        // different result. Skip it unless --force is set (the escape
+        // hatch for force-pushed history or 'I just want to retry').
+        if installed_locally && update && !force && is_pinned_source(&resolved) {
+            status("pinned skill:", name);
+            continue;
+        }
 
         // --update needs a clean slate because install_skill_dir refuses to
         // overwrite an existing directory. The old checksum (if any) is
@@ -1136,14 +1155,40 @@ fn sync_skills(manifest_path: &Path, update: bool) -> Result<()> {
     Ok(())
 }
 
-/// Returns true when the string is shaped like a git SHA. Used in two
-/// places: by fetch_git_skill to choose between a shallow `--branch`
-/// clone and a full clone + checkout, and (in a follow-up) by the
-/// sync loop to honor pinned refs. Tags like `v1.0` and branches like
-/// `main` deliberately do not match — they're mutable references and
-/// should not be treated as pinning evidence.
+/// Returns true when the string is shaped like a git SHA. Used by
+/// fetch_git_skill to choose between a shallow `--branch` clone and a
+/// full clone + checkout, and by is_pinned_source to decide whether
+/// the sync loop should honor the source as pinned. Tags like `v1.0`
+/// and branches like `main` deliberately do not match — they're
+/// mutable references and should not be treated as pinning evidence.
 fn looks_like_sha(s: &str) -> bool {
     matches!(s.len(), 7..=40) && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Returns true when the source's ref pins it to immutable content
+/// (i.e. is SHA-shaped). Sources without a ref concept — HTTP knack
+/// registry aliases, local paths — return false: there's nothing to
+/// pin against, and the sync loop should re-fetch them under
+/// --update like any other moving target.
+fn is_pinned_source(resolved: &str) -> bool {
+    extract_source_ref(resolved)
+        .as_deref()
+        .is_some_and(looks_like_sha)
+}
+
+/// Returns the ref component of a gh: or git+ source. Other source
+/// schemes (http+knack:, paths) have no ref concept and return None.
+/// Defaults like "main" inserted by the parsers come through as
+/// Some("main") rather than None, so the caller can distinguish
+/// "no @ref written" from "no ref concept at all".
+fn extract_source_ref(source: &str) -> Option<String> {
+    if let Some(spec) = source.strip_prefix("gh:") {
+        return parse_github_spec(spec).ok().map(|s| s.reference);
+    }
+    if source.starts_with("git+") {
+        return parse_git_source(source).ok().map(|s| s.reference);
+    }
+    None
 }
 
 fn resolve_source_alias(source: &str, manifest: &Manifest) -> Result<String> {
