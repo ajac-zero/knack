@@ -199,14 +199,14 @@ pub struct LockedSkill {
     pub checksum: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RegistryConfig {
     pub kind: RegistryKind,
     pub url: String,
     pub default_ref: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RegistryKind {
     GitHost,

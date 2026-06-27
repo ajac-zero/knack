@@ -564,10 +564,45 @@ fn registry_add(
     validate_registry_name(name)?;
     ensure_manifest_exists(manifest_path, default_target)?;
     let mut manifest = read_manifest(manifest_path)?;
-    manifest.registries.insert(name.to_string(), config);
+    let prior = manifest.registries.insert(name.to_string(), config.clone());
     write_manifest(manifest_path, &manifest)?;
-    status("registered registry:", name);
+    match prior {
+        None => status("registered registry:", name),
+        Some(ref old) if old == &config => {
+            notice(&format!("registry already configured: {name}"));
+        }
+        Some(old) => {
+            status("updated registry:", name);
+            print_registry_diff(&old, &config);
+        }
+    }
     Ok(())
+}
+
+fn registry_kind_label(kind: RegistryKind) -> &'static str {
+    match kind {
+        RegistryKind::GitHost => "git-host",
+        RegistryKind::Http => "http",
+    }
+}
+
+/// Print per-field changes for an updated registry alias. Only fields that
+/// actually changed are shown so the diff stays focused on what the user
+/// just did.
+fn print_registry_diff(old: &RegistryConfig, new: &RegistryConfig) {
+    if old.kind != new.kind {
+        anstream::println!(
+            "  kind:        {} -> {}",
+            registry_kind_label(old.kind),
+            registry_kind_label(new.kind),
+        );
+    }
+    if old.url != new.url {
+        anstream::println!("  url:         {} -> {}", old.url, new.url);
+    }
+    if old.default_ref != new.default_ref {
+        anstream::println!("  default-ref: {} -> {}", old.default_ref, new.default_ref,);
+    }
 }
 
 fn registry_list(explicit_manifest: Option<&Path>) -> Result<()> {
