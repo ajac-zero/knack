@@ -71,6 +71,13 @@ enum Command {
         /// Use global scope (~/.agents/) instead of the current project.
         #[arg(short = 'g', long)]
         global: bool,
+
+        /// Verify that the install dir and lockfile match the manifest
+        /// without installing anything. Fails with a non-zero exit code
+        /// on any inconsistency. Suitable for CI: pair with `git diff
+        /// --exit-code` to assert reproducibility.
+        #[arg(long)]
+        check: bool,
     },
 
     /// Re-resolve every skill from its manifest source and reinstall
@@ -476,10 +483,18 @@ fn main() -> Result<()> {
             let default_target = scope.install_target()?;
             add_skill(&manifest, &source, &default_target)?;
         }
-        Command::Sync { manifest, global } => {
+        Command::Sync {
+            manifest,
+            global,
+            check,
+        } => {
             let scope = Scope::from_global_flag(global);
             let manifest = resolve_manifest_path(manifest, scope)?;
-            sync_skills(&manifest)?;
+            if check {
+                check_skills(&manifest)?;
+            } else {
+                sync_skills(&manifest)?;
+            }
         }
         Command::Update {
             manifest,
@@ -1103,6 +1118,77 @@ fn add_skill(manifest_path: &Path, source: &str, default_target: &Path) -> Resul
         installed.name,
         source
     );
+    Ok(())
+}
+
+/// Verify the install directory and lockfile match the manifest
+/// without modifying anything. Used by CI to assert that a checkout
+/// of a project is in a reproducible state before running tests.
+///
+/// Reports each skill's status and exits non-zero on any of:
+/// - Manifest entry has no matching lockfile entry.
+/// - Manifest entry has a lockfile entry but the skill isn't installed.
+/// - Installed skill's checksum differs from the lockfile's.
+///
+/// Multiple problems are collected before bailing so users can fix
+/// everything in one pass instead of one round-trip per problem.
+fn check_skills(manifest_path: &Path) -> Result<()> {
+    let manifest = read_manifest(manifest_path)?;
+    let lockfile_path = lockfile_path_for(manifest_path);
+    let lockfile = read_lockfile(&lockfile_path)?;
+
+    let mut problems: Vec<String> = Vec::new();
+
+    for (name, source) in &manifest.skills {
+        let lock_entry = lockfile
+            .skill
+            .iter()
+            .find(|skill| skill.name == *name && skill.source == *source);
+        let Some(lock_entry) = lock_entry else {
+            problems.push(format!(
+                "skill `{name}` is in the manifest but has no lockfile entry; \
+                 run `knack sync` to regenerate"
+            ));
+            continue;
+        };
+
+        let install_dir = manifest.install.target.join(name);
+        if !install_dir.join("SKILL.md").is_file() {
+            problems.push(format!(
+                "skill `{name}` is locked but not installed at {}; \
+                 run `knack sync`",
+                install_dir.display()
+            ));
+            continue;
+        }
+
+        let actual_checksum = checksum_dir(&install_dir).with_context(|| {
+            format!(
+                "failed to checksum installed skill at {}",
+                install_dir.display()
+            )
+        })?;
+        if actual_checksum != lock_entry.checksum {
+            problems.push(format!(
+                "skill `{name}` checksum drifted: lockfile says {} but install has {}",
+                lock_entry.checksum, actual_checksum
+            ));
+            continue;
+        }
+
+        status("ok:", name);
+    }
+
+    if !problems.is_empty() {
+        for problem in &problems {
+            anstream::eprintln!("knack sync --check: {problem}");
+        }
+        bail!(
+            "{} skill(s) failed sync --check; run `knack sync` to repair",
+            problems.len()
+        );
+    }
+
     Ok(())
 }
 
