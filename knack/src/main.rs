@@ -823,11 +823,21 @@ fn run_git<'a>(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let status = command
-        .status()
+    // Capture stdout+stderr so they don't leak into the user's terminal on
+    // success (git's "Cloning into 'X'..." progress and informational
+    // warnings are noise for a wrapper tool). On failure, attach the
+    // captured stderr to the error so the user still sees what git was
+    // trying to tell them.
+    let output = command
+        .output()
         .with_context(|| format!("failed to run git for {action}; is git installed?"))?;
-    if !status.success() {
-        bail!("git failed to {action}");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            bail!("git failed to {action}");
+        }
+        bail!("git failed to {action}: {detail}");
     }
     Ok(())
 }
