@@ -1256,9 +1256,15 @@ fn extract_source_ref(source: &str) -> Option<String> {
 /// reinstalls from the exact commit a teammate had — even when the
 /// manifest source points at a moving ref like `main`.
 ///
-/// Returns None when the source's scheme has no SHA concept
-/// (http+knack:, local paths) or when the source is malformed; the
-/// caller falls back to the unpinned resolved string in that case.
+/// For `http+knack:` sources the SHA is appended as a URL fragment
+/// (`#sha=...`) since the HTTP knack archive endpoint isn't
+/// content-addressed at the URL level — install_http_skill_archive
+/// strips the fragment before the request. The fragment is purely
+/// client-side metadata: it lets `knack update` detect when the
+/// registry's backing source has moved.
+///
+/// Returns None for local paths and other schemes with no SHA concept;
+/// the caller falls back to the unpinned resolved string in that case.
 fn pin_resolved_with_sha(resolved: &str, sha: &str) -> Option<String> {
     if let Some(spec_str) = resolved.strip_prefix("gh:") {
         let spec = parse_github_spec(spec_str).ok()?;
@@ -1269,6 +1275,13 @@ fn pin_resolved_with_sha(resolved: &str, sha: &str) -> Option<String> {
         let spec = parse_git_source(resolved).ok()?;
         let path = spec.skill_path.to_string_lossy().replace('\\', "/");
         return Some(format!("git+{}@{sha}//{path}", spec.repo_url));
+    }
+    if let Some(url) = resolved.strip_prefix("http+knack:") {
+        // Replace any existing fragment rather than appending — running
+        // `knack update` twice in a row should be idempotent rather than
+        // accumulating fragments.
+        let base = url.split_once('#').map(|(b, _)| b).unwrap_or(url);
+        return Some(format!("http+knack:{base}#sha={sha}"));
     }
     None
 }
@@ -1398,18 +1411,22 @@ fn install_skill(source: &str, target: &PathBuf) -> Result<InstalledSkill> {
 
 fn install_http_skill_archive(url: &str, target: &Path) -> Result<InstalledSkill> {
     fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
+    // Strip any `#sha=...` fragment we may have written into the lockfile's
+    // resolved URL — the fragment is purely client-side bookkeeping and
+    // shouldn't be sent over the wire.
+    let request_url = url.split_once('#').map(|(base, _)| base).unwrap_or(url);
     let response = reqwest::blocking::Client::new()
-        .get(url)
+        .get(request_url)
         .header(reqwest::header::USER_AGENT, "knack")
         .send()
-        .with_context(|| format!("failed to download {url}"))?;
+        .with_context(|| format!("failed to download {request_url}"))?;
 
     // Translate 404 into an actionable diagnostic. The HTTP knack URL
     // produced by resolve_http_alias has the shape
     // `http://...../skills/<name>/archive`, so we can usually recover
     // the skill name and point the user at `knack find` for discovery.
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        let hint = match extract_archive_skill_name(url) {
+        let hint = match extract_archive_skill_name(request_url) {
             Some(name) => format!(
                 "skill `{name}` not found on the registry; \
                  try `knack find {name}` to look for related skills"
@@ -1418,14 +1435,30 @@ fn install_http_skill_archive(url: &str, target: &Path) -> Result<InstalledSkill
                      try `knack find <query>` to discover skills"
                 .to_string(),
         };
-        bail!("{hint} ({url})");
+        bail!("{hint} ({request_url})");
     }
 
     let response = response
         .error_for_status()
-        .with_context(|| format!("registry returned an error for {url}"))?;
+        .with_context(|| format!("registry returned an error for {request_url}"))?;
+
+    // Read the X-Knack-Resolved-Sha header (set by knack-registry when
+    // the archive came from a git-backed source). When present, embed
+    // it in the lockfile's resolved field so peers reinstall from the
+    // same content. Absent for old registries and skills_root-served
+    // archives; we fall back to checksum-based change detection there.
+    let resolved_sha = response
+        .headers()
+        .get("x-knack-resolved-sha")
+        .and_then(|value| value.to_str().ok())
+        .filter(|s| looks_like_sha(s))
+        .map(String::from);
+
     let bytes = response.bytes().context("failed to read skill archive")?;
-    install_archive_reader(flate2::read::GzDecoder::new(Cursor::new(bytes)), target)
+    let mut installed =
+        install_archive_reader(flate2::read::GzDecoder::new(Cursor::new(bytes)), target)?;
+    installed.resolved_sha = resolved_sha;
+    Ok(installed)
 }
 
 /// Recover the skill name from an HTTP knack archive URL of the shape
