@@ -40,9 +40,12 @@ struct Cli {
     #[arg(long)]
     skills_root: Option<PathBuf>,
 
-    /// Optional registry alias to return as install sources, e.g. company.
+    /// Optional name this registry advertises to clients. When set, the
+    /// `/info` endpoint returns it and the `/search` endpoint rewrites
+    /// install sources as `<name>:<skill>`. Clients that omit the name
+    /// argument to `knack registry add` adopt this value automatically.
     #[arg(long)]
-    public_alias: Option<String>,
+    name: Option<String>,
 
     /// Source alias used to resolve backing sources, e.g. tea=git+ssh://git@gitea.example.com.
     #[arg(long = "source-alias")]
@@ -58,8 +61,17 @@ struct AppState {
     index: Arc<RwLock<RegistryIndex>>,
     index_path: PathBuf,
     skills_root: Option<PathBuf>,
-    public_alias: Option<String>,
+    name: Option<String>,
     source_aliases: BTreeMap<String, String>,
+}
+
+/// Payload returned by GET /info so clients can self-configure on
+/// `knack registry add <url>` without having to be told the name out of
+/// band. `name` is null when the registry wasn't started with `--name`.
+#[derive(serde::Serialize)]
+struct RegistryInfo {
+    name: Option<String>,
+    version: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,7 +88,7 @@ async fn main() -> Result<()> {
         index: Arc::new(RwLock::new(index)),
         index_path: cli.index,
         skills_root: cli.skills_root,
-        public_alias: cli.public_alias,
+        name: cli.name,
         source_aliases,
     };
 
@@ -91,6 +103,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/info", get(info))
         .route("/index", get(get_index))
         .route("/search", get(search))
         .route("/skills/{name}/archive", get(skill_archive))
@@ -233,6 +246,13 @@ async fn health() -> &'static str {
     "ok"
 }
 
+async fn info(State(state): State<AppState>) -> Json<RegistryInfo> {
+    Json(RegistryInfo {
+        name: state.name.clone(),
+        version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
 async fn get_index(State(state): State<AppState>) -> Json<RegistryIndex> {
     Json(state.index.read().await.clone())
 }
@@ -244,9 +264,9 @@ async fn search(
     let index = state.index.read().await;
     let mut results: Vec<IndexedSkill> = index.search(&params.q).into_iter().cloned().collect();
     drop(index);
-    if let Some(alias) = &state.public_alias {
+    if let Some(name) = &state.name {
         for skill in &mut results {
-            skill.source = format!("{}:{}", alias, skill.name);
+            skill.source = format!("{}:{}", name, skill.name);
         }
     }
     Json(results)
