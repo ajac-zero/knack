@@ -95,6 +95,12 @@ enum Command {
         /// to retry the install.
         #[arg(short = 'f', long)]
         force: bool,
+
+        /// Report what would change without modifying the install target
+        /// or lockfile. Still hits the network to fetch fresh content
+        /// so the report is accurate.
+        #[arg(short = 'n', long)]
+        dry_run: bool,
     },
 
     /// Find skills to install from configured registries.
@@ -479,10 +485,11 @@ fn main() -> Result<()> {
             manifest,
             global,
             force,
+            dry_run,
         } => {
             let scope = Scope::from_global_flag(global);
             let manifest = resolve_manifest_path(manifest, scope)?;
-            update_skills(&manifest, force)?;
+            update_skills(&manifest, force, dry_run)?;
         }
         Command::Find { query, manifest } => {
             find_registry_skills(manifest.as_deref(), &query)?;
@@ -1147,7 +1154,7 @@ fn sync_skills(manifest_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn update_skills(manifest_path: &Path, force: bool) -> Result<()> {
+fn update_skills(manifest_path: &Path, force: bool, dry_run: bool) -> Result<()> {
     let manifest = read_manifest(manifest_path)?;
     let lockfile_path = lockfile_path_for(manifest_path);
     let mut lockfile = read_lockfile(&lockfile_path)?;
@@ -1170,15 +1177,34 @@ fn update_skills(manifest_path: &Path, force: bool) -> Result<()> {
             continue;
         }
 
-        // install_skill_dir refuses to overwrite an existing directory,
-        // so clear the slate first. The old checksum is captured first
-        // so we can tell the user whether anything actually changed
-        // after re-installing.
         let prior_checksum = lockfile
             .skill
             .iter()
             .find(|skill| skill.name == *name)
             .map(|skill| skill.checksum.clone());
+
+        if dry_run {
+            // Install into a scratch tempdir to see what we'd get, then
+            // throw it away. Network cost is the same as a real update;
+            // the only thing we skip is touching the install target and
+            // the lockfile.
+            let scratch = tempfile::tempdir()
+                .context("failed to create temporary directory for --dry-run")?;
+            let scratch_target = scratch.path().to_path_buf();
+            let installed = install_skill(&resolved, &scratch_target)?;
+            let new_checksum = checksum_dir(&installed.path)?;
+            if !installed_locally {
+                status("would install skill:", name);
+            } else if prior_checksum.as_ref() == Some(&new_checksum) {
+                status("unchanged skill:", name);
+            } else {
+                status("would update skill:", name);
+            }
+            continue;
+        }
+
+        // install_skill_dir refuses to overwrite an existing directory,
+        // so clear the slate first.
         if installed_locally {
             let existing = manifest.install.target.join(name);
             fs::remove_dir_all(&existing)
@@ -1211,7 +1237,9 @@ fn update_skills(manifest_path: &Path, force: bool) -> Result<()> {
         }
     }
 
-    write_lockfile(&lockfile_path, &lockfile)?;
+    if !dry_run {
+        write_lockfile(&lockfile_path, &lockfile)?;
+    }
     Ok(())
 }
 
