@@ -752,8 +752,8 @@ fn print_registry_diff(old: &RegistryConfig, new: &RegistryConfig) {
 }
 
 fn registry_list(explicit_manifest: Option<&Path>) -> Result<()> {
-    let manifest = read_manifest_for_read(explicit_manifest)?;
-    for (name, registry) in effective_registries(&manifest)? {
+    let (manifest, manifest_path) = read_manifest_for_read(explicit_manifest)?;
+    for (name, registry) in effective_registries(&manifest, &manifest_path)? {
         let name_style = accent_style();
         let label_style = label_style();
         anstream::println!(
@@ -785,8 +785,8 @@ fn find_registry_skills(explicit_manifest: Option<&Path>, query: &str) -> Result
         bail!("find query must not be empty");
     }
 
-    let manifest = read_manifest_for_read(explicit_manifest)?;
-    let registries = effective_registries(&manifest)?;
+    let (manifest, manifest_path) = read_manifest_for_read(explicit_manifest)?;
+    let registries = effective_registries(&manifest, &manifest_path)?;
     let mut matches = Vec::new();
 
     for (name, registry) in registries {
@@ -842,7 +842,7 @@ fn publish_skill(
     validate_skill(&skill)?;
 
     let manifest = read_manifest(manifest_path)?;
-    let registries = effective_registries(&manifest)?;
+    let registries = effective_registries(&manifest, manifest_path)?;
     let registry = match registries.get(registry_name) {
         Some(registry) => registry,
         None => bail!(
@@ -1023,13 +1023,17 @@ fn read_optional_manifest(manifest_path: &Path) -> Result<Option<Manifest>> {
 /// is an error. When no `--manifest` was given, fall back to the project's
 /// default path and return an empty manifest if it does not exist yet, so the
 /// caller can still surface registries inherited from global and system scopes
-/// via `effective_registries`.
-fn read_manifest_for_read(explicit_path: Option<&Path>) -> Result<Manifest> {
+/// via `effective_registries`. Returns the path the manifest was loaded from
+/// (or would have been, if missing) so callers can pass it to
+/// `effective_registries` for canonical-layer deduplication.
+fn read_manifest_for_read(explicit_path: Option<&Path>) -> Result<(Manifest, PathBuf)> {
     match explicit_path {
-        Some(path) => read_manifest(path),
+        Some(path) => Ok((read_manifest(path)?, path.to_path_buf())),
         None => {
             let default = Scope::Project.manifest_path()?;
-            Ok(read_optional_manifest(&default)?.unwrap_or_else(|| Manifest::new(PathBuf::new())))
+            let manifest =
+                read_optional_manifest(&default)?.unwrap_or_else(|| Manifest::new(PathBuf::new()));
+            Ok((manifest, default))
         }
     }
 }
@@ -1097,7 +1101,7 @@ fn add_skill(manifest_path: &Path, source: &str, default_target: &Path) -> Resul
     let mut manifest = read_manifest(manifest_path)?;
     let lockfile_path = lockfile_path_for(manifest_path);
     let mut lockfile = read_lockfile(&lockfile_path)?;
-    let resolved_source = resolve_source_alias(source, &manifest)?;
+    let resolved_source = resolve_source_alias(source, &manifest, manifest_path)?;
     let installed = install_skill(&resolved_source, &manifest.install.target)?;
     manifest
         .skills
@@ -1224,7 +1228,7 @@ fn sync_skills(manifest_path: &Path) -> Result<()> {
             .find(|skill| skill.name == *name && skill.source == *source)
             .map(|skill| skill.resolved.clone())
             .map(Ok)
-            .unwrap_or_else(|| resolve_source_alias(source, &manifest))?;
+            .unwrap_or_else(|| resolve_source_alias(source, &manifest, manifest_path))?;
 
         let installed = install_skill(&resolved, &manifest.install.target)?;
         let locked_resolved = installed
@@ -1261,7 +1265,7 @@ fn update_skills(manifest_path: &Path, force: bool, dry_run: bool) -> Result<()>
         // Always re-resolve from the manifest source — that's the whole
         // point of update — so alias-routed sources actually hit the
         // registry/git again rather than reusing the cached resolution.
-        let resolved = resolve_source_alias(source, &manifest)?;
+        let resolved = resolve_source_alias(source, &manifest, manifest_path)?;
 
         // Honor pinned refs: a SHA-shaped ref is content-addressed and
         // re-fetching can't produce a different result. --force is the
@@ -1408,7 +1412,7 @@ fn pin_resolved_with_sha(resolved: &str, sha: &str) -> Option<String> {
     None
 }
 
-fn resolve_source_alias(source: &str, manifest: &Manifest) -> Result<String> {
+fn resolve_source_alias(source: &str, manifest: &Manifest, manifest_path: &Path) -> Result<String> {
     if source.starts_with("gh:") || source.starts_with("git+") || Path::new(source).exists() {
         return Ok(source.to_string());
     }
@@ -1416,7 +1420,7 @@ fn resolve_source_alias(source: &str, manifest: &Manifest) -> Result<String> {
     let Some((alias, rest)) = source.split_once(':') else {
         return Ok(source.to_string());
     };
-    let registries = effective_registries(manifest)?;
+    let registries = effective_registries(manifest, manifest_path)?;
     let Some(registry) = registries.get(alias) else {
         // Reject the source rather than falling through to install_local_skill,
         // whose "install source does not exist" diagnostic gives no hint that
@@ -1449,18 +1453,41 @@ fn resolve_http_alias(registry: &RegistryConfig, rest: &str) -> Result<String> {
 
 fn effective_registries(
     manifest: &Manifest,
+    manifest_path: &Path,
 ) -> Result<std::collections::BTreeMap<String, RegistryConfig>> {
     let mut registries = std::collections::BTreeMap::new();
 
-    if let Some(system) = read_optional_manifest(&Scope::System.manifest_path()?)? {
-        registries.extend(system.registries);
+    // Always read every canonical scope from disk so a project-defined
+    // alias is reachable from `knack add -g`, `knack update -g`, etc.
+    // The previous shape merged `system + global + passed_manifest`, so
+    // when the user passed `-g` the "passed manifest" *was* the global
+    // one and the project manifest at CWD was never consulted — that's
+    // the bug reproduced in the maya-contigo-frontend report.
+    let system_path = Scope::System.manifest_path()?;
+    let global_path = Scope::Global.manifest_path()?;
+    let project_path = Scope::Project.manifest_path()?;
+
+    for path in [&system_path, &global_path, &project_path] {
+        if let Some(m) = read_optional_manifest(path)? {
+            registries.extend(m.registries);
+        }
     }
 
-    if let Some(global) = read_optional_manifest(&Scope::Global.manifest_path()?)? {
-        registries.extend(global.registries);
+    // If the user pointed `--manifest <custom>` at a path outside the
+    // canonical scope layers, apply it as the highest-priority override.
+    // When the passed path *is* one of the canonical layers (the common
+    // case — scope flags resolve to canonical paths), we already absorbed
+    // it above, so skip to avoid clobbering project-over-global ordering.
+    let passed_canon = manifest_path.canonicalize().ok();
+    let already_layered = passed_canon.as_ref().is_some_and(|p| {
+        [&system_path, &global_path, &project_path]
+            .iter()
+            .any(|s| s.canonicalize().ok().as_ref() == Some(p))
+    });
+    if !already_layered {
+        registries.extend(manifest.registries.clone());
     }
 
-    registries.extend(manifest.registries.clone());
     Ok(registries)
 }
 
