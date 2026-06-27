@@ -611,8 +611,8 @@ fn registry_list(explicit_manifest: Option<&Path>) -> Result<()> {
         let name_style = accent_style();
         let label_style = label_style();
         anstream::println!(
-            "{name_style}{name}{name_style:#}\t{label_style}{:?}{label_style:#}\t{}",
-            registry.kind,
+            "{name_style}{name}{name_style:#}\t{label_style}{}{label_style:#}\t{}",
+            registry_kind_label(registry.kind),
             registry.url
         );
     }
