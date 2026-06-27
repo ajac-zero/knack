@@ -586,6 +586,27 @@ fn registry_kind_label(kind: RegistryKind) -> &'static str {
     }
 }
 
+/// Hint suffix appended to "no registry registered as X" diagnostics.
+/// Lists the aliases the user does have, or tells them how to add one if
+/// the manifest is bare. Kept separate from the diagnostic itself so that
+/// callers can prepend whatever context is locally meaningful (e.g. the
+/// source string being resolved on `knack add`).
+fn unknown_registry_hint(
+    registries: &std::collections::BTreeMap<String, RegistryConfig>,
+) -> String {
+    if registries.is_empty() {
+        "no registries are configured; register one with \
+         `knack registry add <name> <url>`"
+            .to_string()
+    } else {
+        let known: Vec<&str> = registries.keys().map(String::as_str).collect();
+        format!(
+            "known aliases: {}; run `knack registry list` for details",
+            known.join(", "),
+        )
+    }
+}
+
 /// Print per-field changes for an updated registry alias. Only fields that
 /// actually changed are shown so the diff stays focused on what the user
 /// just did.
@@ -697,11 +718,21 @@ fn publish_skill(
 
     let manifest = read_manifest(manifest_path)?;
     let registries = effective_registries(&manifest)?;
-    let registry = registries
-        .get(registry_name)
-        .ok_or_else(|| anyhow!("registry not found: {registry_name}"))?;
-    if !matches!(registry.kind, RegistryKind::GitHost) {
-        bail!("publish currently supports only git-host registries");
+    let registry = match registries.get(registry_name) {
+        Some(registry) => registry,
+        None => bail!(
+            "no registry registered as `{registry_name}`; {}",
+            unknown_registry_hint(&registries),
+        ),
+    };
+    match registry.kind {
+        RegistryKind::GitHost => {}
+        RegistryKind::Http => bail!(
+            "registry `{registry_name}` is configured as `http`, but \
+             `knack publish` only supports git-host registries; register \
+             a git-host registry with `knack registry add <name> git+ssh://...` \
+             and pass that alias to `--registry`"
+        ),
     }
 
     let repo_url = git_host_repo_url(&registry.url, repo)?;
@@ -986,6 +1017,17 @@ fn resolve_source_alias(source: &str, manifest: &Manifest) -> Result<String> {
     };
     let registries = effective_registries(manifest)?;
     let Some(registry) = registries.get(alias) else {
+        // Reject the source rather than falling through to install_local_skill,
+        // whose "install source does not exist" diagnostic gives no hint that
+        // the user probably meant a registry alias. Only trigger when the
+        // prefix actually looks like a valid alias name; that lets exotic
+        // local paths containing ':' continue to pass through.
+        if validate_registry_name(alias).is_ok() {
+            bail!(
+                "no registry registered as `{alias}` (resolving source `{source}`); {}",
+                unknown_registry_hint(&registries),
+            );
+        }
         return Ok(source.to_string());
     };
 
