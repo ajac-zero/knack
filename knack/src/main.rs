@@ -65,6 +65,13 @@ enum Command {
         /// Use global scope (~/.agents/) instead of the current project.
         #[arg(short = 'g', long)]
         global: bool,
+
+        /// Re-resolve and reinstall every skill, ignoring the lockfile's
+        /// previously resolved sources. Useful when a skill's source
+        /// points at a moving ref (e.g. a branch) and the upstream
+        /// content has changed.
+        #[arg(short = 'U', long)]
+        update: bool,
     },
 
     /// Find skills to install from configured registries.
@@ -381,10 +388,14 @@ fn main() -> Result<()> {
             let default_target = scope.install_target()?;
             add_skill(&manifest, &source, &default_target)?;
         }
-        Command::Sync { manifest, global } => {
+        Command::Sync {
+            manifest,
+            global,
+            update,
+        } => {
             let scope = Scope::from_global_flag(global);
             let manifest = resolve_manifest_path(manifest, scope)?;
-            sync_skills(&manifest)?;
+            sync_skills(&manifest, update)?;
         }
         Command::Find { query, manifest } => {
             find_registry_skills(manifest.as_deref(), &query)?;
@@ -995,7 +1006,7 @@ fn add_skill(manifest_path: &Path, source: &str, default_target: &Path) -> Resul
     Ok(())
 }
 
-fn sync_skills(manifest_path: &Path) -> Result<()> {
+fn sync_skills(manifest_path: &Path, update: bool) -> Result<()> {
     let manifest = read_manifest(manifest_path)?;
     let lockfile_path = lockfile_path_for(manifest_path);
     let mut lockfile = read_lockfile(&lockfile_path)?;
@@ -1003,29 +1014,62 @@ fn sync_skills(manifest_path: &Path) -> Result<()> {
         .with_context(|| format!("failed to create {}", manifest.install.target.display()))?;
 
     for (name, source) in &manifest.skills {
-        if is_skill_installed(name, &manifest.install.target) {
+        let installed_locally = is_skill_installed(name, &manifest.install.target);
+
+        if installed_locally && !update {
             status("already installed:", name);
             continue;
         }
 
-        let resolved = lockfile
+        // For --update we always re-resolve from the alias rather than
+        // trusting the lockfile, since the whole point of the flag is to
+        // pick up upstream changes that the lockfile is unaware of.
+        let resolved = if update {
+            resolve_source_alias(source, &manifest)?
+        } else {
+            lockfile
+                .skill
+                .iter()
+                .find(|skill| skill.name == *name && skill.source == *source)
+                .map(|skill| skill.resolved.clone())
+                .map(Ok)
+                .unwrap_or_else(|| resolve_source_alias(source, &manifest))?
+        };
+
+        // --update needs a clean slate because install_skill_dir refuses to
+        // overwrite an existing directory. The old checksum (if any) is
+        // captured first so we can tell the user whether anything actually
+        // changed after re-installing.
+        let prior_checksum = lockfile
             .skill
             .iter()
-            .find(|skill| skill.name == *name && skill.source == *source)
-            .map(|skill| skill.resolved.clone())
-            .map(Ok)
-            .unwrap_or_else(|| resolve_source_alias(source, &manifest))?;
+            .find(|skill| skill.name == *name)
+            .map(|skill| skill.checksum.clone());
+        if installed_locally && update {
+            let existing = manifest.install.target.join(name);
+            fs::remove_dir_all(&existing)
+                .with_context(|| format!("failed to remove {}", existing.display()))?;
+        }
+
         let installed = install_skill(&resolved, &manifest.install.target)?;
+        let new_checksum = checksum_dir(&installed.path)?;
         upsert_lock(
             &mut lockfile,
             LockedSkill {
                 name: installed.name.clone(),
                 source: source.clone(),
                 resolved,
-                checksum: checksum_dir(&installed.path)?,
+                checksum: new_checksum.clone(),
             },
         );
-        status("synced skill:", installed.name);
+
+        if update && prior_checksum.as_ref() == Some(&new_checksum) {
+            status("unchanged skill:", installed.name);
+        } else if update {
+            status("updated skill:", installed.name);
+        } else {
+            status("synced skill:", installed.name);
+        }
     }
 
     write_lockfile(&lockfile_path, &lockfile)?;
