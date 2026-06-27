@@ -60,10 +60,9 @@ By default, commands use project scope:
 .agents/skills/
 ```
 
-Use global scope for user-wide skills:
+Use global scope for user-wide skills. `knack add` creates the manifest on first use, so an explicit `knack init` is only needed if you want to customize the install target:
 
 ```bash
-knack init --scope global
 knack add gh:anthropics/skills/skills/pdf --scope global
 knack sync --scope global
 knack list --scope global

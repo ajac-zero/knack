@@ -364,7 +364,8 @@ fn main() -> Result<()> {
             scope,
         } => {
             let manifest = resolve_manifest_path(manifest, scope)?;
-            add_skill(&manifest, &source)?;
+            let default_target = scope.install_target()?;
+            add_skill(&manifest, &source, &default_target)?;
         }
         Command::Sync { manifest, scope } => {
             let manifest = resolve_manifest_path(manifest, scope)?;
@@ -754,8 +755,19 @@ fn init_manifest(manifest_path: &Path, target: &Path) -> Result<()> {
     if manifest_path.exists() {
         bail!("manifest already exists: {}", manifest_path.display());
     }
+    ensure_manifest_exists(manifest_path, target)
+}
 
-    let manifest = Manifest::new(target.to_path_buf());
+/// Create a default manifest at `manifest_path` with the given default target
+/// when one does not already exist. No-op when the file is already present.
+/// Prints a `created manifest:` status line when it creates a new file so the
+/// side effect is visible to the caller.
+fn ensure_manifest_exists(manifest_path: &Path, default_target: &Path) -> Result<()> {
+    if manifest_path.exists() {
+        return Ok(());
+    }
+
+    let manifest = Manifest::new(default_target.to_path_buf());
     write_manifest(manifest_path, &manifest)?;
     status("created manifest:", manifest_path.display());
     Ok(())
@@ -826,7 +838,8 @@ fn upsert_lock(lockfile: &mut Lockfile, locked_skill: LockedSkill) {
         .sort_by(|left, right| left.name.cmp(&right.name));
 }
 
-fn add_skill(manifest_path: &Path, source: &str) -> Result<()> {
+fn add_skill(manifest_path: &Path, source: &str, default_target: &Path) -> Result<()> {
+    ensure_manifest_exists(manifest_path, default_target)?;
     let mut manifest = read_manifest(manifest_path)?;
     let lockfile_path = lockfile_path_for(manifest_path);
     let mut lockfile = read_lockfile(&lockfile_path)?;
