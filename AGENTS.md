@@ -48,7 +48,7 @@ Commit message convention (visible in `jj log`): Conventional Commits with scope
 
 ## Architecture notes that aren't obvious from filenames
 
-**Config scope layering** (`knack/src/main.rs`, `enum Scope`): registries from `system` (`/etc/knack/knack.toml`) and `global` (`~/.config/knack/knack.toml`) are merged into the effective set used by `project` (`.agents/knack.toml`). Later layers override earlier ones. See `effective_registries()`.
+**Config scope layering** (`knack/src/main.rs`, `enum Scope`): registries from `system` (`/etc/knack/knack.toml`) and `global` (`~/.agents/knack.toml`) are merged into the effective set used by `project` (`.agents/knack.toml`). Later layers override earlier ones. See `effective_registries()`. Both project and global use `.agents/` for symmetry; only the system path remains knack-specific because `/etc/` is the convention there.
 
 **Custom source URL schemes the CLI parses** (project vocabulary; not standards):
 

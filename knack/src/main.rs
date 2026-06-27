@@ -9,7 +9,6 @@ use std::{
 use anstyle::{AnsiColor, Effects, Style};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use directories::ProjectDirs;
 use flate2::{Compression, write::GzEncoder};
 use knack_core::{
     IndexedSkill, LockedSkill, Lockfile, Manifest, RegistryConfig, RegistryIndex, RegistryKind,
@@ -38,7 +37,7 @@ enum Command {
         #[arg(long)]
         target: Option<PathBuf>,
 
-        /// Initialize the global manifest (~/.config/knack/knack.toml) instead of the current project's .agents/knack.toml.
+        /// Initialize the global manifest (~/.agents/knack.toml) instead of the current project's .agents/knack.toml.
         #[arg(short = 'g', long)]
         global: bool,
     },
@@ -52,7 +51,7 @@ enum Command {
         #[arg(long)]
         manifest: Option<PathBuf>,
 
-        /// Use global scope (~/.config/knack/) instead of the current project.
+        /// Use global scope (~/.agents/) instead of the current project.
         #[arg(short = 'g', long)]
         global: bool,
     },
@@ -63,7 +62,7 @@ enum Command {
         #[arg(long)]
         manifest: Option<PathBuf>,
 
-        /// Use global scope (~/.config/knack/) instead of the current project.
+        /// Use global scope (~/.agents/) instead of the current project.
         #[arg(short = 'g', long)]
         global: bool,
     },
@@ -104,7 +103,7 @@ enum Command {
         #[arg(long)]
         manifest: Option<PathBuf>,
 
-        /// Use global scope (~/.config/knack/) instead of the current project.
+        /// Use global scope (~/.agents/) instead of the current project.
         #[arg(short = 'g', long)]
         global: bool,
 
@@ -216,7 +215,7 @@ enum RegistryCommand {
         #[arg(long)]
         manifest: Option<PathBuf>,
 
-        /// Use global scope (~/.config/knack/) instead of the current project.
+        /// Use global scope (~/.agents/) instead of the current project.
         #[arg(short = 'g', long)]
         global: bool,
     },
@@ -242,7 +241,7 @@ enum RegistryCommand {
         #[arg(long)]
         manifest: Option<PathBuf>,
 
-        /// Use global scope (~/.config/knack/) instead of the current project.
+        /// Use global scope (~/.agents/) instead of the current project.
         #[arg(short = 'g', long)]
         global: bool,
     },
@@ -282,7 +281,7 @@ impl Scope {
     fn manifest_path(self) -> Result<PathBuf> {
         match self {
             Self::Project => Ok(PathBuf::from(".agents/knack.toml")),
-            Self::Global => Ok(config_dir()?.join("knack.toml")),
+            Self::Global => Ok(home_dir()?.join(".agents/knack.toml")),
             Self::System => Ok(PathBuf::from("/etc/knack/knack.toml")),
         }
     }
@@ -294,12 +293,6 @@ impl Scope {
             Self::System => Ok(PathBuf::from("/usr/local/share/knack/skills")),
         }
     }
-}
-
-fn config_dir() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("io", "knack", "knack")
-        .ok_or_else(|| anyhow!("failed to resolve global config directory"))?;
-    Ok(dirs.config_dir().to_path_buf())
 }
 
 fn home_dir() -> Result<PathBuf> {

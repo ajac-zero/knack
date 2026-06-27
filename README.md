@@ -71,8 +71,8 @@ knack list -g
 Global scope uses:
 
 ```text
-~/.config/knack/knack.toml
-~/.config/knack/knack.lock
+~/.agents/knack.toml
+~/.agents/knack.lock
 ~/.agents/skills/
 ```
 
@@ -89,7 +89,7 @@ Registry aliases are inherited in this order, with later layers overriding earli
 
 ```text
 system (/etc/knack/knack.toml)
-global (~/.config/knack/knack.toml)
+global (~/.agents/knack.toml)
 project (./.agents/knack.toml)
 ```
 
