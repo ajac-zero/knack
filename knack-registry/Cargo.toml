@@ -18,7 +18,7 @@ axum = "0.8.7"
 clap = { version = "4.5.40", features = ["derive"] }
 flate2 = "1.1.5"
 serde = { version = "1.0.219", features = ["derive"] }
-knack-core = { version = "0.2.0", path = "../knack-core" }
+knack-core = { version = "0.2.1", path = "../knack-core" }
 tar = "0.4.44"
 tempfile = "3.24.0"
 tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread", "signal"] }
