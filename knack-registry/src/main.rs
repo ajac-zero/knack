@@ -363,30 +363,55 @@ fn fetch_source_root(
 
     let temp_dir = tempfile::tempdir().context("failed to create temporary directory")?;
     let repo_dir = temp_dir.path().join("repo");
-    let status = ProcessCommand::new("git")
-        .arg("clone")
-        .arg("--depth")
-        .arg("1")
-        .arg("--branch")
-        .arg(&git.reference)
-        .arg(&git.repo_url)
-        .arg(&repo_dir)
-        .status()
-        .with_context(|| "failed to run git clone; is git installed?")?;
-
-    if !status.success() {
-        bail!(
-            "git clone failed for backing source {} at ref {}",
-            git.repo_url,
-            git.reference
-        );
-    }
+    let repo_dir_str = repo_dir.to_str().unwrap_or_default();
+    let action = format!("clone {} at ref {}", git.repo_url, git.reference);
+    run_git(
+        [
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            &git.reference,
+            &git.repo_url,
+            repo_dir_str,
+        ],
+        None,
+        &action,
+    )?;
 
     let skill_dir = repo_dir.join(git.skill_path);
     Ok(FetchedBackingSource {
         path: skill_dir,
         _temp_dir: temp_dir,
     })
+}
+
+/// Run git with stdout+stderr captured so the registry's logs aren't
+/// polluted with git's progress output on every archive request. On
+/// failure, attach the captured stderr to the error so operators still
+/// see what git was trying to say. Mirrors the CLI's run_git helper.
+fn run_git<'a>(
+    args: impl IntoIterator<Item = &'a str>,
+    cwd: Option<&Path>,
+    action: &str,
+) -> Result<()> {
+    let mut command = ProcessCommand::new("git");
+    command.args(args);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run git for {action}; is git installed?"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            bail!("git failed to {action}");
+        }
+        bail!("git failed to {action}: {detail}");
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
