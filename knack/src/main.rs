@@ -107,7 +107,9 @@ enum Command {
         #[arg(short = 'g', long)]
         global: bool,
 
-        /// Do not push the generated commit.
+        /// Do not push the generated commit. The clone is preserved on
+        /// disk and its path is printed so you can inspect the result
+        /// and push manually when ready.
         #[arg(long)]
         no_push: bool,
     },
@@ -781,11 +783,22 @@ fn publish_skill(
         Some(&checkout),
         "commit published skill",
     )?;
-    if !no_push {
+    if no_push {
+        // Persist the temp dir so the user can inspect or push the
+        // generated commit manually. Without this, --no-push was nearly
+        // a no-op: the working tree was deleted on function return and
+        // the commit went with it.
+        let persisted = temp_dir.keep();
+        let persisted_checkout = persisted.join("repo");
+        status("prepared publish for:", &skill.name);
+        notice(&format!(
+            "commit left unpushed; inspect or push from: {}",
+            persisted_checkout.display(),
+        ));
+    } else {
         run_git(["push"], Some(&checkout), "push published skill")?;
+        status("published skill:", skill.name);
     }
-
-    status("published skill:", skill.name);
     Ok(())
 }
 
