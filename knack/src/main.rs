@@ -8,7 +8,21 @@ use std::{
 
 use anstyle::{AnsiColor, Effects, Style};
 use anyhow::{Context, Result, anyhow, bail};
+use clap::builder::styling::Styles;
 use clap::{Parser, Subcommand};
+
+/// Colour palette for clap's --help renderer. Matches the runtime
+/// success/accent/label palette used by the status() helper so the
+/// help text feels like part of the same program rather than a
+/// dropped-in stock template.
+const HELP_STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .usage(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .literal(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+    .placeholder(AnsiColor::Blue.on_default())
+    .error(AnsiColor::Red.on_default().effects(Effects::BOLD))
+    .valid(AnsiColor::Green.on_default())
+    .invalid(AnsiColor::Yellow.on_default());
 use flate2::{Compression, write::GzEncoder};
 use knack_core::{
     IndexedSkill, LockedSkill, Lockfile, Manifest, RegistryConfig, RegistryIndex, RegistryKind,
@@ -20,6 +34,7 @@ use tempfile::TempDir;
 #[derive(Debug, Parser)]
 #[command(name = "knack")]
 #[command(version, about = "Package, share, and install Agent Skills")]
+#[command(styles = HELP_STYLES)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

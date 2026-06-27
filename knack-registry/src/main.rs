@@ -18,6 +18,18 @@ use axum::{
     routing::get,
 };
 use clap::Parser;
+use clap::builder::styling::{AnsiColor, Effects, Styles};
+
+/// Colour palette for clap's --help renderer. Matches the knack CLI so
+/// running `--help` on either binary feels like the same toolchain.
+const HELP_STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .usage(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .literal(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+    .placeholder(AnsiColor::Blue.on_default())
+    .error(AnsiColor::Red.on_default().effects(Effects::BOLD))
+    .valid(AnsiColor::Green.on_default())
+    .invalid(AnsiColor::Yellow.on_default());
 use flate2::{Compression, write::GzEncoder};
 use knack_core::{IndexedSkill, RegistryIndex, collect_files, read_skill, validate_skill};
 use serde::Deserialize;
@@ -27,6 +39,7 @@ use tokio::sync::RwLock;
 #[derive(Debug, Parser)]
 #[command(name = "knack-registry")]
 #[command(version, about = "Serve and search a knack registry index")]
+#[command(styles = HELP_STYLES)]
 struct Cli {
     /// Path to a knack registry index TOML file.
     #[arg(long, default_value = "knack.index.toml")]
