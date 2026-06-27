@@ -1301,24 +1301,21 @@ struct GitSourceSpec {
 fn fetch_git_skill(spec: &GitSourceSpec) -> Result<FetchedSkill> {
     let temp_dir = tempfile::tempdir().context("failed to create temporary directory")?;
     let repo_dir = temp_dir.path().join("repo");
-    let status = ProcessCommand::new("git")
-        .arg("clone")
-        .arg("--depth")
-        .arg("1")
-        .arg("--branch")
-        .arg(&spec.reference)
-        .arg(&spec.repo_url)
-        .arg(&repo_dir)
-        .status()
-        .with_context(|| "failed to run git clone; is git installed?")?;
-
-    if !status.success() {
-        bail!(
-            "git clone failed for {} at ref {}",
-            spec.repo_url,
-            spec.reference
-        );
-    }
+    let repo_dir_str = repo_dir.to_str().unwrap_or_default();
+    let action = format!("clone {} at ref {}", spec.repo_url, spec.reference);
+    run_git(
+        [
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            &spec.reference,
+            &spec.repo_url,
+            repo_dir_str,
+        ],
+        None,
+        &action,
+    )?;
 
     let skill_dir = repo_dir.join(&spec.skill_path);
     let skill = read_skill(&skill_dir).with_context(|| {
