@@ -69,17 +69,18 @@ enum Command {
     },
 
     /// Find skills to install from configured registries.
+    ///
+    /// Searches the merged set of registries from project, global, and
+    /// system configs, so a global registry is reachable from a directory
+    /// with no project manifest. No scope flag needed.
     Find {
         /// Search query.
         query: String,
 
-        /// Path to the project manifest.
+        /// Path to a specific manifest to read instead of the default
+        /// project manifest.
         #[arg(long)]
         manifest: Option<PathBuf>,
-
-        /// Use global scope (~/.config/knack/) instead of the current project.
-        #[arg(short = 'g', long)]
-        global: bool,
     },
 
     /// Publish a skill to a git-backed skill repository.
@@ -221,14 +222,15 @@ enum RegistryCommand {
     },
 
     /// List registry aliases.
+    ///
+    /// Shows the merged set of aliases from project, global, and system
+    /// configs, so a global alias is listed even from a directory with no
+    /// project manifest. No scope flag needed.
     List {
-        /// Path to the project manifest.
+        /// Path to a specific manifest to read instead of the default
+        /// project manifest.
         #[arg(long)]
         manifest: Option<PathBuf>,
-
-        /// Use global scope (~/.config/knack/) instead of the current project.
-        #[arg(short = 'g', long)]
-        global: bool,
     },
 
     /// Remove a registry alias.
@@ -382,14 +384,8 @@ fn main() -> Result<()> {
             let manifest = resolve_manifest_path(manifest, scope)?;
             sync_skills(&manifest)?;
         }
-        Command::Find {
-            query,
-            manifest,
-            global,
-        } => {
-            let scope = Scope::from_global_flag(global);
-            let manifest = resolve_manifest_path(manifest, scope)?;
-            find_registry_skills(&manifest, &query)?;
+        Command::Find { query, manifest } => {
+            find_registry_skills(manifest.as_deref(), &query)?;
         }
         Command::Publish {
             path,
@@ -464,10 +460,8 @@ fn handle_registry_command(command: RegistryCommand) -> Result<()> {
                 },
             )?;
         }
-        RegistryCommand::List { manifest, global } => {
-            let scope = Scope::from_global_flag(global);
-            let manifest_path = resolve_manifest_path(manifest, scope)?;
-            registry_list(&manifest_path)?;
+        RegistryCommand::List { manifest } => {
+            registry_list(manifest.as_deref())?;
         }
         RegistryCommand::Remove {
             name,
@@ -570,8 +564,8 @@ fn registry_add(manifest_path: &Path, name: &str, config: RegistryConfig) -> Res
     Ok(())
 }
 
-fn registry_list(manifest_path: &Path) -> Result<()> {
-    let manifest = read_manifest(manifest_path)?;
+fn registry_list(explicit_manifest: Option<&Path>) -> Result<()> {
+    let manifest = read_manifest_for_read(explicit_manifest)?;
     for (name, registry) in effective_registries(&manifest)? {
         let name_style = accent_style();
         let label_style = label_style();
@@ -598,13 +592,13 @@ fn validate_registry_name(name: &str) -> Result<()> {
     validate_skill_name(name).context("registry aliases use the same naming rules as skills")
 }
 
-fn find_registry_skills(manifest_path: &Path, query: &str) -> Result<()> {
+fn find_registry_skills(explicit_manifest: Option<&Path>, query: &str) -> Result<()> {
     let query = query.trim();
     if query.is_empty() {
         bail!("find query must not be empty");
     }
 
-    let manifest = read_manifest(manifest_path)?;
+    let manifest = read_manifest_for_read(explicit_manifest)?;
     let registries = effective_registries(&manifest)?;
     let mut matches = Vec::new();
 
@@ -804,6 +798,22 @@ fn read_optional_manifest(manifest_path: &Path) -> Result<Option<Manifest>> {
     }
 
     read_manifest(manifest_path).map(Some)
+}
+
+/// Returns a manifest suitable for read-only commands (find, registry list).
+/// When the caller passed an explicit `--manifest`, the file must exist or it
+/// is an error. When no `--manifest` was given, fall back to the project's
+/// default path and return an empty manifest if it does not exist yet, so the
+/// caller can still surface registries inherited from global and system scopes
+/// via `effective_registries`.
+fn read_manifest_for_read(explicit_path: Option<&Path>) -> Result<Manifest> {
+    match explicit_path {
+        Some(path) => read_manifest(path),
+        None => {
+            let default = Scope::Project.manifest_path()?;
+            Ok(read_optional_manifest(&default)?.unwrap_or_else(|| Manifest::new(PathBuf::new())))
+        }
+    }
 }
 
 fn write_manifest(manifest_path: &Path, manifest: &Manifest) -> Result<()> {

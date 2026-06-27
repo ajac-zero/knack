@@ -95,6 +95,8 @@ project (./.agents/knack.toml)
 
 That lets administrators inject aliases such as `tea:` for all users while still allowing user or project-level overrides.
 
+Read-only commands (`knack find`, `knack registry list`) search the merged set of registries from all three layers automatically. They work from a directory with no project manifest, so a globally-registered `company:` alias is reachable without an explicit `-g`.
+
 Add and install a skill source into the manifest target:
 
 ```bash
