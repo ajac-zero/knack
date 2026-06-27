@@ -185,10 +185,55 @@ pub struct InstallConfig {
     pub target: PathBuf,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+/// Current lockfile schema version. Bump when the on-disk layout
+/// changes in a way an older `knack` couldn't safely interpret.
+///
+/// Backward compatibility is one-way: a new knack reading an old
+/// lockfile should keep working (with default values for new fields).
+/// An old knack reading a new lockfile errors loudly rather than
+/// guessing — that's what `Lockfile::ensure_supported_version`
+/// enforces.
+pub const LOCKFILE_VERSION: u32 = 1;
+
+fn default_lockfile_version() -> u32 {
+    LOCKFILE_VERSION
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Lockfile {
+    /// Schema version. Older lockfiles without this field default to
+    /// version 1 since v1 is identical to the pre-versioned layout —
+    /// only the SHA-pinning convention differs, and that's transparent
+    /// to the parser.
+    #[serde(default = "default_lockfile_version")]
+    pub version: u32,
     #[serde(default)]
     pub skill: Vec<LockedSkill>,
+}
+
+impl Default for Lockfile {
+    fn default() -> Self {
+        Self {
+            version: LOCKFILE_VERSION,
+            skill: Vec::new(),
+        }
+    }
+}
+
+impl Lockfile {
+    /// Refuse to operate on a lockfile from a future knack version.
+    /// New schema versions may add fields or change semantics in ways
+    /// this binary can't preserve on round-trip; bailing avoids
+    /// silently corrupting the file when we write it back.
+    pub fn ensure_supported_version(&self) -> Result<(), String> {
+        if self.version > LOCKFILE_VERSION {
+            return Err(format!(
+                "lockfile version {} is newer than this knack supports (max {LOCKFILE_VERSION}); upgrade knack",
+                self.version
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

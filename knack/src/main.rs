@@ -1055,8 +1055,16 @@ fn read_lockfile(lockfile_path: &Path) -> Result<Lockfile> {
 
     let contents = fs::read_to_string(lockfile_path)
         .with_context(|| format!("failed to read {}", lockfile_path.display()))?;
-    toml::from_str(&contents)
-        .with_context(|| format!("failed to parse {}", lockfile_path.display()))
+    let lockfile: Lockfile = toml::from_str(&contents)
+        .with_context(|| format!("failed to parse {}", lockfile_path.display()))?;
+    // Fail loudly if the lockfile was written by a newer knack — we
+    // can't safely round-trip fields we don't know about. The
+    // ensure_supported_version check returns a plain String error
+    // so we attach the file path context here for the user.
+    lockfile
+        .ensure_supported_version()
+        .map_err(|message| anyhow::anyhow!("{} in {}", message, lockfile_path.display()))?;
+    Ok(lockfile)
 }
 
 fn write_lockfile(lockfile_path: &Path, lockfile: &Lockfile) -> Result<()> {
