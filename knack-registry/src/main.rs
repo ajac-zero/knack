@@ -277,26 +277,50 @@ async fn skill_archive(
     AxumPath(name): AxumPath<String>,
 ) -> Response {
     match create_skill_archive(&state, &name).await {
-        Ok(bytes) => (
-            [
-                (header::CONTENT_TYPE, "application/gzip"),
-                (
-                    header::CONTENT_DISPOSITION,
-                    &format!("attachment; filename=\"{}.skill.tar.gz\"", name),
-                ),
-            ],
-            Body::from(bytes),
-        )
-            .into_response(),
+        Ok(archive) => {
+            let disposition = format!("attachment; filename=\"{name}.skill.tar.gz\"");
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/gzip"),
+            );
+            if let Ok(value) = axum::http::HeaderValue::from_str(&disposition) {
+                headers.insert(header::CONTENT_DISPOSITION, value);
+            }
+            if let Some(sha) = archive.resolved_sha {
+                // Clients (knack CLI) use this to pin their lockfile's
+                // `resolved` field. Header is omitted when the backing
+                // source has no SHA (local skills_root, archives we
+                // couldn't rev-parse).
+                if let Ok(value) = axum::http::HeaderValue::from_str(&sha) {
+                    headers.insert(
+                        axum::http::HeaderName::from_static("x-knack-resolved-sha"),
+                        value,
+                    );
+                }
+            }
+            (headers, Body::from(archive.bytes)).into_response()
+        }
         Err(error) => (StatusCode::NOT_FOUND, error.to_string()).into_response(),
     }
 }
 
-async fn create_skill_archive(state: &AppState, name: &str) -> Result<Vec<u8>> {
+struct SkillArchive {
+    bytes: Vec<u8>,
+    resolved_sha: Option<String>,
+}
+
+async fn create_skill_archive(state: &AppState, name: &str) -> Result<SkillArchive> {
     if let Some(skills_root) = &state.skills_root {
         let skill_dir = skills_root.join(name);
         if skill_dir.join("SKILL.md").is_file() {
-            return create_skill_archive_from_dir(&skill_dir);
+            // Local skills_root has no upstream git history to capture,
+            // so no SHA. Clients fall back to checksum-based change
+            // detection for these.
+            return Ok(SkillArchive {
+                bytes: create_skill_archive_from_dir(&skill_dir)?,
+                resolved_sha: None,
+            });
         }
     }
 
@@ -309,7 +333,10 @@ async fn create_skill_archive(state: &AppState, name: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("skill not found: {name}"))?;
     drop(index);
     let fetched = fetch_backing_source(&source, state)?;
-    create_skill_archive_from_dir(&fetched.path)
+    Ok(SkillArchive {
+        bytes: create_skill_archive_from_dir(&fetched.path)?,
+        resolved_sha: fetched.resolved_sha,
+    })
 }
 
 fn create_skill_archive_from_dir(skill_dir: &Path) -> Result<Vec<u8>> {
@@ -339,6 +366,11 @@ fn create_skill_archive_from_dir(skill_dir: &Path) -> Result<Vec<u8>> {
 struct FetchedBackingSource {
     path: PathBuf,
     _temp_dir: tempfile::TempDir,
+    /// Commit SHA captured from `git rev-parse HEAD` in the cloned
+    /// backing repo. Surfaced to clients via the X-Knack-Resolved-Sha
+    /// response header so they can pin their lockfiles to specific
+    /// content. None when capture fails (treated as 'no SHA available').
+    resolved_sha: Option<String>,
 }
 
 fn fetch_backing_source(source: &str, state: &AppState) -> Result<FetchedBackingSource> {
@@ -379,11 +411,41 @@ fn fetch_source_root(
         &action,
     )?;
 
+    let resolved_sha = capture_git_head_sha(&repo_dir).ok();
     let skill_dir = repo_dir.join(git.skill_path);
     Ok(FetchedBackingSource {
         path: skill_dir,
         _temp_dir: temp_dir,
+        resolved_sha,
     })
+}
+
+/// Run `git rev-parse HEAD` in `repo_dir` and return the full 40-char
+/// SHA. Mirrors the CLI's helper of the same name. Returns Err on any
+/// failure; callers treat that as 'no SHA available'.
+fn capture_git_head_sha(repo_dir: &Path) -> Result<String> {
+    let output = ProcessCommand::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .context("failed to invoke git rev-parse HEAD")?;
+    if !output.status.success() {
+        bail!("git rev-parse HEAD failed");
+    }
+    let sha = String::from_utf8(output.stdout)
+        .context("git rev-parse HEAD returned non-UTF-8")?
+        .trim()
+        .to_string();
+    if !looks_like_sha(&sha) {
+        bail!("git rev-parse HEAD returned a non-SHA-shaped value: {sha}");
+    }
+    Ok(sha)
+}
+
+/// Heuristic SHA detector — 7 to 40 ASCII hex chars. Used as a sanity
+/// check on git's output. Tags and branches don't match and never will.
+fn looks_like_sha(s: &str) -> bool {
+    matches!(s.len(), 7..=40) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Run git with stdout+stderr captured so the registry's logs aren't
