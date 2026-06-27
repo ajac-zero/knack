@@ -56,7 +56,13 @@ enum Command {
         global: bool,
     },
 
-    /// Install all skills declared in the project manifest.
+    /// Install missing skills using the lockfile for reproducibility.
+    ///
+    /// Skills that already exist on disk are left untouched. Skills missing
+    /// from the install target are installed via the lockfile's
+    /// `resolved` source — which is SHA-pinned where possible — so every
+    /// run produces the same content. Use `knack update` to pick up
+    /// upstream changes.
     Sync {
         /// Path to the project manifest.
         #[arg(long)]
@@ -65,21 +71,29 @@ enum Command {
         /// Use global scope (~/.agents/) instead of the current project.
         #[arg(short = 'g', long)]
         global: bool,
+    },
 
-        /// Re-resolve and reinstall every skill, ignoring the lockfile's
-        /// previously resolved sources. Useful when a skill's source
-        /// points at a moving ref (e.g. a branch) and the upstream
-        /// content has changed. Sources pinned to a SHA-shaped ref are
-        /// skipped — pass --force to override.
-        #[arg(short = 'U', long)]
-        update: bool,
+    /// Re-resolve every skill from its manifest source and reinstall
+    /// anything that has changed upstream.
+    ///
+    /// Sources pinned to a SHA-shaped ref are skipped — they're immutable
+    /// by definition, so there's nothing to update. Pass --force to
+    /// re-fetch them anyway (useful if upstream force-pushed).
+    Update {
+        /// Path to the project manifest.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
 
-        /// Re-resolve and reinstall sources that --update would otherwise
-        /// skip because their ref is SHA-shaped (and therefore immutable).
-        /// Useful when a force-push has rewritten history under a SHA you
-        /// previously installed, or when you just want to retry the
-        /// install. Requires --update.
-        #[arg(short = 'f', long, requires = "update")]
+        /// Use global scope (~/.agents/) instead of the current project.
+        #[arg(short = 'g', long)]
+        global: bool,
+
+        /// Re-resolve and reinstall sources that would otherwise be
+        /// skipped because their ref is SHA-shaped (and therefore
+        /// immutable). Useful when a force-push has rewritten history
+        /// under a SHA you previously installed, or when you just want
+        /// to retry the install.
+        #[arg(short = 'f', long)]
         force: bool,
     },
 
@@ -456,15 +470,19 @@ fn main() -> Result<()> {
             let default_target = scope.install_target()?;
             add_skill(&manifest, &source, &default_target)?;
         }
-        Command::Sync {
+        Command::Sync { manifest, global } => {
+            let scope = Scope::from_global_flag(global);
+            let manifest = resolve_manifest_path(manifest, scope)?;
+            sync_skills(&manifest)?;
+        }
+        Command::Update {
             manifest,
             global,
-            update,
             force,
         } => {
             let scope = Scope::from_global_flag(global);
             let manifest = resolve_manifest_path(manifest, scope)?;
-            sync_skills(&manifest, update, force)?;
+            update_skills(&manifest, force)?;
         }
         Command::Find { query, manifest } => {
             find_registry_skills(manifest.as_deref(), &query)?;
@@ -1076,7 +1094,50 @@ fn add_skill(manifest_path: &Path, source: &str, default_target: &Path) -> Resul
     Ok(())
 }
 
-fn sync_skills(manifest_path: &Path, update: bool, force: bool) -> Result<()> {
+fn sync_skills(manifest_path: &Path) -> Result<()> {
+    let manifest = read_manifest(manifest_path)?;
+    let lockfile_path = lockfile_path_for(manifest_path);
+    let mut lockfile = read_lockfile(&lockfile_path)?;
+    fs::create_dir_all(&manifest.install.target)
+        .with_context(|| format!("failed to create {}", manifest.install.target.display()))?;
+
+    for (name, source) in &manifest.skills {
+        if is_skill_installed(name, &manifest.install.target) {
+            status("already installed:", name);
+            continue;
+        }
+
+        // Prefer the lockfile's resolved source over re-resolving the
+        // manifest source — the lockfile is the source of truth for
+        // reproducibility. Fall back to fresh resolution only when there
+        // is no matching lock entry (i.e. a manifest entry added by
+        // hand or a brand-new clone of someone else's project).
+        let resolved = lockfile
+            .skill
+            .iter()
+            .find(|skill| skill.name == *name && skill.source == *source)
+            .map(|skill| skill.resolved.clone())
+            .map(Ok)
+            .unwrap_or_else(|| resolve_source_alias(source, &manifest))?;
+
+        let installed = install_skill(&resolved, &manifest.install.target)?;
+        upsert_lock(
+            &mut lockfile,
+            LockedSkill {
+                name: installed.name.clone(),
+                source: source.clone(),
+                resolved,
+                checksum: checksum_dir(&installed.path)?,
+            },
+        );
+        status("synced skill:", installed.name);
+    }
+
+    write_lockfile(&lockfile_path, &lockfile)?;
+    Ok(())
+}
+
+fn update_skills(manifest_path: &Path, force: bool) -> Result<()> {
     let manifest = read_manifest(manifest_path)?;
     let lockfile_path = lockfile_path_for(manifest_path);
     let mut lockfile = read_lockfile(&lockfile_path)?;
@@ -1086,45 +1147,29 @@ fn sync_skills(manifest_path: &Path, update: bool, force: bool) -> Result<()> {
     for (name, source) in &manifest.skills {
         let installed_locally = is_skill_installed(name, &manifest.install.target);
 
-        if installed_locally && !update {
-            status("already installed:", name);
-            continue;
-        }
+        // Always re-resolve from the manifest source — that's the whole
+        // point of update — so alias-routed sources actually hit the
+        // registry/git again rather than reusing the cached resolution.
+        let resolved = resolve_source_alias(source, &manifest)?;
 
-        // For --update we always re-resolve from the alias rather than
-        // trusting the lockfile, since the whole point of the flag is to
-        // pick up upstream changes that the lockfile is unaware of.
-        let resolved = if update {
-            resolve_source_alias(source, &manifest)?
-        } else {
-            lockfile
-                .skill
-                .iter()
-                .find(|skill| skill.name == *name && skill.source == *source)
-                .map(|skill| skill.resolved.clone())
-                .map(Ok)
-                .unwrap_or_else(|| resolve_source_alias(source, &manifest))?
-        };
-
-        // Honor pinned refs on --update: a source pinned to a SHA-shaped
-        // ref is content-addressed and re-fetching can't produce a
-        // different result. Skip it unless --force is set (the escape
-        // hatch for force-pushed history or 'I just want to retry').
-        if installed_locally && update && !force && is_pinned_source(&resolved) {
+        // Honor pinned refs: a SHA-shaped ref is content-addressed and
+        // re-fetching can't produce a different result. --force is the
+        // escape hatch for 'upstream force-pushed' or 'just retry'.
+        if installed_locally && !force && is_pinned_source(&resolved) {
             status("pinned skill:", name);
             continue;
         }
 
-        // --update needs a clean slate because install_skill_dir refuses to
-        // overwrite an existing directory. The old checksum (if any) is
-        // captured first so we can tell the user whether anything actually
-        // changed after re-installing.
+        // install_skill_dir refuses to overwrite an existing directory,
+        // so clear the slate first. The old checksum is captured first
+        // so we can tell the user whether anything actually changed
+        // after re-installing.
         let prior_checksum = lockfile
             .skill
             .iter()
             .find(|skill| skill.name == *name)
             .map(|skill| skill.checksum.clone());
-        if installed_locally && update {
+        if installed_locally {
             let existing = manifest.install.target.join(name);
             fs::remove_dir_all(&existing)
                 .with_context(|| format!("failed to remove {}", existing.display()))?;
@@ -1142,12 +1187,12 @@ fn sync_skills(manifest_path: &Path, update: bool, force: bool) -> Result<()> {
             },
         );
 
-        if update && prior_checksum.as_ref() == Some(&new_checksum) {
-            status("unchanged skill:", installed.name);
-        } else if update {
-            status("updated skill:", installed.name);
-        } else {
+        if !installed_locally {
             status("synced skill:", installed.name);
+        } else if prior_checksum.as_ref() == Some(&new_checksum) {
+            status("unchanged skill:", installed.name);
+        } else {
+            status("updated skill:", installed.name);
         }
     }
 

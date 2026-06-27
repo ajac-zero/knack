@@ -105,10 +105,20 @@ knack add gh:anthropics/skills/skills/pdf
 
 This updates `.agents/knack.toml` and writes `.agents/knack.lock` with the resolved source and a deterministic checksum of the installed skill contents.
 
-Sync all skills declared in `.agents/knack.toml`:
+Install all skills declared in `.agents/knack.toml` (uses the lockfile,
+reproducible):
 
 ```bash
 knack sync
+```
+
+Pull upstream changes for skills tracking a moving ref (branch, tag).
+Sources pinned to a SHA-shaped ref are skipped — pass `-f` / `--force`
+to retry them anyway:
+
+```bash
+knack update           # branch/tag-tracking skills get refreshed
+knack update --force   # ignore pinning, re-fetch everything
 ```
 
 Validate a skill:
