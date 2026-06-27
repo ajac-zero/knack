@@ -15,8 +15,20 @@ pub struct Skill {
     pub description: String,
 }
 
+/// Agent Skills frontmatter knack understands. Unknown fields are
+/// silently ignored: the SKILL.md format is shared across tooling
+/// (Anthropic's catalog, third-party agents, internal extensions),
+/// and other tools write fields like `hidden` that knack has no use
+/// for. Rejecting them broke `knack list` whenever a foreign skill
+/// landed in `.agents/skills/` — the user couldn't list any skill
+/// just because one of them had an extra field.
+///
+/// Required fields (`name`, `description`) still fail loudly on
+/// typos: serde reports "missing field `description`" rather than
+/// silently accepting `desciption`. Typos in optional fields will
+/// silently be dropped, which is the usual YAML/serde convention
+/// and the acceptable tradeoff for ecosystem interop.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 struct SkillFrontmatter {
     name: String,
@@ -364,6 +376,36 @@ mod tests {
     #[test]
     fn rejects_missing_frontmatter() {
         assert!(parse_frontmatter("# demo\n").is_err());
+    }
+
+    #[test]
+    fn tolerates_unknown_frontmatter_fields() {
+        // Reported by a user whose `knack list` blew up on agent-browser's
+        // SKILL.md because it set `hidden: true`. Knack doesn't model that
+        // field — and shouldn't have to — so parsing must skip past it.
+        let frontmatter = parse_frontmatter(
+            "---\n\
+             name: agent-browser\n\
+             description: Browser automation.\n\
+             allowed-tools: Bash(agent-browser:*)\n\
+             hidden: true\n\
+             custom-field: arbitrary\n\
+             ---\n",
+        )
+        .expect("foreign fields must be ignored, not rejected");
+        assert_eq!(frontmatter.name, "agent-browser");
+        assert_eq!(frontmatter.description, "Browser automation.");
+        assert_eq!(
+            frontmatter.allowed_tools.as_deref(),
+            Some("Bash(agent-browser:*)")
+        );
+    }
+
+    #[test]
+    fn still_requires_name_and_description() {
+        // Removing deny_unknown_fields shouldn't make typos in REQUIRED
+        // fields silent. Missing `description` should still fail.
+        assert!(parse_frontmatter("---\nname: x\ndesciption: oops\n---\n").is_err());
     }
 
     #[test]

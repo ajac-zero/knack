@@ -58,7 +58,7 @@ Commit message convention (visible in `jj log`): Conventional Commits with scope
 - `alias:skill-name` — http registry alias (resolves to `http+knack:` internally)
 - `http+knack:<url>` — internal proxied archive URL, **not user-facing**
 
-**Frontmatter parsing** (`knack-core/src/lib.rs`, `SkillFrontmatter`) uses `#[serde(deny_unknown_fields)]`. Adding any new field to `SKILL.md` frontmatter requires adding it to the struct, or every existing skill fails to parse.
+**Frontmatter parsing** (`knack-core/src/lib.rs`, `SkillFrontmatter`) is tolerant of unknown fields. The SKILL.md format is shared across the Agent Skills ecosystem (Anthropic catalog, third-party agents, internal extensions) and we silently ignore fields knack doesn't model so foreign skills can be listed/installed without a knack release. Required fields (`name`, `description`) still fail loudly on omission or typo.
 
 **Skill name == directory name** is enforced by `validate_skill()`. The same `validate_skill_name` is also used to validate index entries — change it carefully.
 
