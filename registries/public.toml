@@ -1,0 +1,139 @@
+# Public knack registry — curated source list
+#
+# This file is the authoritative input to the public knack registry
+# instance maintained by the knack project. Mirror it for your own
+# registry, or fork & extend with internal sources:
+#
+#   knack-registry --index registries/public.toml --name knackpub \
+#                  --refresh-interval-seconds 3600 --bind 0.0.0.0:7349
+#
+# `gh:` sources resolve directly against github.com and need no
+# operator-configured --source-alias.
+#
+# ----------------------------------------------------------------------
+# Curation criteria (in roughly decreasing weight)
+# ----------------------------------------------------------------------
+#   1. Vendor-official: published by the org whose product the skill
+#      describes (anthropics, vercel, microsoft, supabase, etc.).
+#   2. Named-individual with a public track record we can vouch for.
+#   3. Distinct skills, not the same content cross-listed under
+#      multiple accounts to inflate leaderboard positions.
+#   4. Active maintenance — default branch updated in the last ~6
+#      months. Stale repos can be removed at any time.
+#
+# Things we deliberately exclude:
+#   - "awesome-*" curated link lists. They contain READMEs pointing
+#     at other skills, not SKILL.md files, so they index nothing.
+#   - Repos with suspiciously uniform install counts across multiple
+#     accounts (cross-listing the same AI-media skills under three
+#     different orgs to game the leaderboard).
+#   - Repos with high GitHub star counts but no real usage signal.
+#
+# ----------------------------------------------------------------------
+# Proposing a new source
+# ----------------------------------------------------------------------
+# Open a PR adding a [[source]] entry under the right tier section,
+# alphabetically within the tier, with a one-line comment naming the
+# skills it provides. Include in the PR body:
+#   - Why the source meets the curation criteria above.
+#   - Whether you're the maintainer of the source repo or someone
+#     vouching for it from outside.
+#   - Any subpath needed to avoid walking unrelated trees (e.g. a
+#     monorepo's apps/ or packages/ directories).
+#
+# PRs that add curated link lists, inflated personal repos, or
+# duplicate cross-listings will be declined. The bar is deliberately
+# conservative while the ecosystem stabilizes; we'd rather index 200
+# trustworthy skills than 5000 noisy ones.
+#
+# ======================================================================
+# Tier 1 — vendor-official
+# ======================================================================
+
+[[source]]
+source = "gh:anthropics/skills/skills"
+tags = ["official", "anthropic"]
+# 17 skills: pdf, docx, pptx, xlsx, skill-creator, frontend-design,
+# canvas-design, brand-guidelines, doc-coauthoring, claude-api,
+# algorithmic-art, internal-comms, mcp-builder, slack-gif-creator,
+# theme-factory, web-artifacts-builder, webapp-testing. Subpath
+# excludes the repo's top-level template/SKILL.md authoring stub.
+
+[[source]]
+source = "gh:remotion-dev/skills"
+tags = ["official", "remotion"]
+# 1 skill: remotion (programmatic video generation).
+
+[[source]]
+source = "gh:shadcn-ui/ui/skills"
+tags = ["official", "shadcn"]
+# 1 skill: shadcn (component & design system management). Subpath
+# avoids walking the full pnpm monorepo.
+
+[[source]]
+source = "gh:supabase/agent-skills"
+tags = ["official", "supabase"]
+# 2 skills: supabase, supabase-postgres-best-practices.
+
+[[source]]
+source = "gh:vercel-labs/agent-browser/skills"
+tags = ["official", "vercel"]
+# 1 skill: agent-browser (browser automation). Subpath skips the
+# skill-data/ config shards that aren't user-facing skills.
+
+[[source]]
+source = "gh:vercel-labs/agent-skills"
+tags = ["official", "vercel"]
+# 9 skills: react-best-practices, web-design-guidelines,
+# composition-patterns, react-native-skills, react-view-transitions,
+# vercel-cli-with-tokens, vercel-optimize, writing-guidelines,
+# deploy-to-vercel.
+
+[[source]]
+source = "gh:vercel-labs/skills"
+tags = ["official", "vercel"]
+# 1 skill: find-skills (the most-installed skill on skills.sh).
+
+# ======================================================================
+# Tier 2 — vendor-official, larger volume
+# ======================================================================
+# These bring a lot of skills each. We trust the org but the high count
+# means heavier registry refresh cost and a noisier search experience;
+# they're separated so operators running a smaller registry can comment
+# out the whole section.
+
+[[source]]
+source = "gh:googleworkspace/cli"
+tags = ["official", "google"]
+# 95 skills under gws-*: Drive, Calendar, Docs, Gmail, Sheets,
+# Slides, Chat, Admin Reports, Classroom, Forms, Meet, etc.
+
+[[source]]
+source = "gh:microsoft/azure-skills/.github/plugins/azure-skills"
+tags = ["official", "microsoft", "azure"]
+# 28 top-level skills under azure-* / entra-* / microsoft-foundry /
+# airunway-aks-setup / appinsights-instrumentation / python-appservice-
+# deploy. The repo also contains nested sub-skills (e.g. inside
+# microsoft-foundry/) which our walker deliberately ignores — a
+# directory containing SKILL.md is treated as a single skill.
+
+# ======================================================================
+# Tier 3 — named individuals
+# ======================================================================
+
+[[source]]
+source = "gh:mattpocock/skills/skills/engineering"
+tags = ["community", "typescript"]
+# ~16 skills under engineering/: ask-matt, codebase-design,
+# diagnosing-bugs, domain-modeling, grill-me, grill-with-docs,
+# implement, tdd, teach, triage, write-a-skill, zoom-out, etc.
+# Subpath skips the deprecated/ tree. Author: Matt Pocock.
+
+[[source]]
+source = "gh:obra/superpowers"
+tags = ["community"]
+# 14 skills: brainstorming, systematic-debugging, test-driven-
+# development, writing-plans, executing-plans, requesting-code-
+# review, receiving-code-review, subagent-driven-development,
+# dispatching-parallel-agents, finishing-a-development-branch,
+# using-git-worktrees, using-superpowers, etc. Author: Jesse Vincent.

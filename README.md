@@ -332,6 +332,8 @@ knack find deploy
 knack add company:deploy-container
 ```
 
+`gh:` sources resolve directly against github.com and need no `--source-alias`. The curated source list used by the project's public registry instance lives at [`registries/public.toml`](registries/public.toml) — mirror it for your own registry, or open a PR with a new `[[source]]` entry to propose adding a source to the public one. The file's header documents the curation criteria and PR process.
+
 Publish a local skill into a git-backed team skills repository:
 
 ```bash
