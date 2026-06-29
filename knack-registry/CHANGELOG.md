@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/ajac-zero/knack/compare/knack-registry-v0.2.1...knack-registry-v0.2.2) - 2026-06-29
+
+### Added
+
+- *(cli)* bootstrap public registry on knack init
+- *(registry)* build-static subcommand for offline-baked deployments
+- *(registry)* skip invalid skills during materialize, keep going
+- *(registry)* resolve gh: sources directly against github.com
+
+### Fixed
+
+- fix(core)/feat(registry): split metadata validation, drop dir-match for indexed skills
+
+### Other
+
+- daily workflow to publish the public knack registry to R2
+- *(registry)* persistent source cache with incremental refresh
+- *(registry)* partial+sparse clone for sources with a subpath
+- curated source list for the public knack registry
+
 ## [0.2.1](https://github.com/ajac-zero/knack/compare/knack-registry-v0.2.0...knack-registry-v0.2.1) - 2026-06-27
 
 ### Other
