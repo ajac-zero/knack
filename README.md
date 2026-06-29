@@ -52,6 +52,8 @@ Initialize a project manifest:
 knack init
 ```
 
+This seeds the public knack registry (`public` → `https://knack.ajac-zero.com`) into the new manifest so you can `knack find <term>` and `knack add public:<name>` immediately. Pass `--no-public-registry` to skip if you want a bare manifest or only intend to use an internal registry. Either way, you can remove the bootstrapped entry later with `knack registry remove public`.
+
 By default, commands use project scope:
 
 ```text

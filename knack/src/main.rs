@@ -23,6 +23,21 @@ const HELP_STYLES: Styles = Styles::styled()
     .error(AnsiColor::Red.on_default().effects(Effects::BOLD))
     .valid(AnsiColor::Green.on_default())
     .invalid(AnsiColor::Yellow.on_default());
+
+/// The public knack registry bootstrapped by `knack init` so users
+/// have skills available immediately, without having to discover and
+/// add a registry as a separate first step. Opt out with
+/// `knack init --no-public-registry`; remove later with
+/// `knack registry remove public`.
+///
+/// Hard-coded rather than fetched from /info at init time so init
+/// works offline. The HTTP scheme is fixed (RegistryKind::Http);
+/// changing the URL here changes the bootstrap default, not the
+/// runtime contract — existing manifests keep whatever URL they were
+/// written with.
+const PUBLIC_REGISTRY_NAME: &str = "public";
+const PUBLIC_REGISTRY_URL: &str = "https://knack.ajac-zero.com";
+
 use flate2::{Compression, write::GzEncoder};
 use knack_core::{
     IndexedSkill, LockedSkill, Lockfile, Manifest, RegistryConfig, RegistryIndex, RegistryKind,
@@ -55,6 +70,14 @@ enum Command {
         /// Initialize the global manifest (~/.agents/knack.toml) instead of the current project's .agents/knack.toml.
         #[arg(short = 'g', long)]
         global: bool,
+
+        /// Skip seeding the public knack registry (https://knack.ajac-zero.com)
+        /// into the new manifest. By default `knack init` registers it as
+        /// `public` so common skills are available via `knack add public:<name>`
+        /// out of the box. Pass this flag if you want a strictly empty
+        /// manifest, or if you intend to use a private/internal registry only.
+        #[arg(long)]
+        no_public_registry: bool,
     },
 
     /// Install a skill source and record it in the project manifest.
@@ -491,11 +514,12 @@ fn main() -> Result<()> {
             manifest,
             target,
             global,
+            no_public_registry,
         } => {
             let scope = Scope::from_global_flag(global);
             let manifest = resolve_manifest_path(manifest, scope)?;
             let target = resolve_target_path(target, scope)?;
-            init_manifest(&manifest, &target)?;
+            init_manifest(&manifest, &target, !no_public_registry)?;
         }
         Command::Add {
             source,
@@ -1006,11 +1030,36 @@ fn search_http_registry(base_url: &str, query: &str) -> Result<Vec<IndexedSkill>
         .context("failed to decode registry search results")
 }
 
-fn init_manifest(manifest_path: &Path, target: &Path) -> Result<()> {
+fn init_manifest(manifest_path: &Path, target: &Path, bootstrap_public: bool) -> Result<()> {
     if manifest_path.exists() {
         bail!("manifest already exists: {}", manifest_path.display());
     }
-    ensure_manifest_exists(manifest_path, target)
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let mut manifest = Manifest::new(target.to_path_buf());
+    if bootstrap_public {
+        manifest.registries.insert(
+            PUBLIC_REGISTRY_NAME.to_string(),
+            RegistryConfig {
+                kind: RegistryKind::Http,
+                url: PUBLIC_REGISTRY_URL.to_string(),
+                // Ignored for HTTP registries (see RegistryConfig docs);
+                // matches the default emitted by `knack registry add`.
+                default_ref: "main".to_string(),
+            },
+        );
+    }
+    write_manifest(manifest_path, &manifest)?;
+    status("created manifest:", manifest_path.display());
+    if bootstrap_public {
+        status(
+            "seeded registry:",
+            format!("{PUBLIC_REGISTRY_NAME} ({PUBLIC_REGISTRY_URL})"),
+        );
+    }
+    Ok(())
 }
 
 /// Create a default manifest at `manifest_path` with the given default target
