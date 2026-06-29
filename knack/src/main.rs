@@ -98,10 +98,19 @@ enum Command {
     /// Re-resolve every skill from its manifest source and reinstall
     /// anything that has changed upstream.
     ///
+    /// Pass one or more skill names to update only those skills,
+    /// leaving the rest at their current lockfile state. Without
+    /// arguments, update touches every skill in the manifest.
+    ///
     /// Sources pinned to a SHA-shaped ref are skipped — they're immutable
     /// by definition, so there's nothing to update. Pass --force to
     /// re-fetch them anyway (useful if upstream force-pushed).
     Update {
+        /// Names of skills to update. When omitted, every skill in the
+        /// manifest is updated. Skills not present in the manifest are
+        /// rejected upfront before any network is touched.
+        skills: Vec<String>,
+
         /// Path to the project manifest.
         #[arg(long)]
         manifest: Option<PathBuf>,
@@ -512,6 +521,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Update {
+            skills,
             manifest,
             global,
             force,
@@ -519,7 +529,7 @@ fn main() -> Result<()> {
         } => {
             let scope = Scope::from_global_flag(global);
             let manifest = resolve_manifest_path(manifest, scope)?;
-            update_skills(&manifest, force, dry_run)?;
+            update_skills(&manifest, force, dry_run, &skills)?;
         }
         Command::Find { query, manifest } => {
             find_registry_skills(manifest.as_deref(), &query)?;
@@ -1267,14 +1277,46 @@ fn sync_skills(manifest_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn update_skills(manifest_path: &Path, force: bool, dry_run: bool) -> Result<()> {
+fn update_skills(
+    manifest_path: &Path,
+    force: bool,
+    dry_run: bool,
+    skill_filter: &[String],
+) -> Result<()> {
     let manifest = read_manifest(manifest_path)?;
     let lockfile_path = lockfile_path_for(manifest_path);
     let mut lockfile = read_lockfile(&lockfile_path)?;
     fs::create_dir_all(&manifest.install.target)
         .with_context(|| format!("failed to create {}", manifest.install.target.display()))?;
 
+    // Validate the targeted-update filter against the manifest upfront so we
+    // can reject typos before doing any network work. A user running
+    // `knack update deplyo-app` should see "unknown skill" immediately, not
+    // a "0 skills updated" silent success.
+    if !skill_filter.is_empty() {
+        let unknown: Vec<&str> = skill_filter
+            .iter()
+            .filter(|name| !manifest.skills.contains_key(name.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            let known: Vec<&str> = manifest.skills.keys().map(String::as_str).collect();
+            bail!(
+                "skill(s) not in manifest: {}; manifest declares: {}",
+                unknown.join(", "),
+                if known.is_empty() {
+                    "(no skills)".to_string()
+                } else {
+                    known.join(", ")
+                },
+            );
+        }
+    }
+
     for (name, source) in &manifest.skills {
+        if !skill_filter.is_empty() && !skill_filter.iter().any(|wanted| wanted == name) {
+            continue;
+        }
         let installed_locally = is_skill_installed(name, &manifest.install.target);
 
         // Always re-resolve from the manifest source — that's the whole

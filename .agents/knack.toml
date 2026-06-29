@@ -1,0 +1,9 @@
+[install]
+target = ".agents/skills"
+
+[skills]
+
+[registries.banorte]
+kind = "http"
+url = "http://knack-registry.apps.svc.cluster.local"
+default_ref = "main"
