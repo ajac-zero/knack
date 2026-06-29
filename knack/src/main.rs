@@ -1247,20 +1247,29 @@ fn sync_skills(manifest_path: &Path) -> Result<()> {
         // reproducibility. Fall back to fresh resolution only when there
         // is no matching lock entry (i.e. a manifest entry added by
         // hand or a brand-new clone of someone else's project).
-        let resolved = lockfile
+        let from_lockfile = lockfile
             .skill
             .iter()
             .find(|skill| skill.name == *name && skill.source == *source)
-            .map(|skill| skill.resolved.clone())
-            .map(Ok)
-            .unwrap_or_else(|| resolve_source_alias(source, &manifest, manifest_path))?;
+            .map(|skill| skill.resolved.clone());
+        let from_manifest = resolve_source_alias(source, &manifest, manifest_path)?;
+        let primary = from_lockfile.unwrap_or_else(|| from_manifest.clone());
 
-        let installed = install_skill(&resolved, &manifest.install.target)?;
+        let (installed, source_used) = install_skill_with_sha_fallback(
+            &primary,
+            &from_manifest,
+            &manifest.install.target,
+            name,
+        )?;
+        // Pin the lockfile against whichever URL we actually installed
+        // from — that's the URL the captured SHA is meaningful relative
+        // to. When the fallback fired, that's the manifest's URL with
+        // its moving ref; when it didn't, it's primary unchanged.
         let locked_resolved = installed
             .resolved_sha
             .as_deref()
-            .and_then(|sha| pin_resolved_with_sha(&resolved, sha))
-            .unwrap_or(resolved);
+            .and_then(|sha| pin_resolved_with_sha(source_used, sha))
+            .unwrap_or_else(|| source_used.to_string());
         upsert_lock(
             &mut lockfile,
             LockedSkill {
@@ -1586,6 +1595,51 @@ struct InstalledSkill {
     /// field into a content-addressed form so peers get the same
     /// commit on `knack sync`.
     resolved_sha: Option<String>,
+}
+
+/// Install from `primary`, but if that fails AND `primary` had a
+/// SHA-shaped pinned ref AND `fallback_source` differs, warn the user
+/// and retry against `fallback_source`. Returns both the installed
+/// skill and the source string actually used so the caller can re-pin
+/// the lockfile against the URL whose SHA was captured.
+///
+/// Real-world scenario this handles: a teammate's lockfile pins
+/// `gh:owner/repo@<sha>/path` but the upstream branch got force-pushed
+/// and that SHA no longer exists. Without fallback, `knack sync` is
+/// dead in the water until someone runs `knack update --force`. With
+/// fallback, sync notices the SHA is gone, re-resolves the manifest
+/// source (which still has a moving ref like @main), installs that,
+/// and rewrites the lockfile to whatever the new SHA is. The user
+/// sees a warning so the silent shift from 'pinned' to 'latest' is
+/// visible.
+///
+/// The fallback only triggers when `primary` is genuinely SHA-pinned
+/// — branch and tag refs are intentionally NOT eligible, because
+/// 'main moved' or 'a tag was retagged' are upstream issues the user
+/// should know about, not auto-paper-over.
+fn install_skill_with_sha_fallback<'a>(
+    primary: &'a str,
+    fallback_source: &'a str,
+    target: &PathBuf,
+    skill_name: &str,
+) -> Result<(InstalledSkill, &'a str)> {
+    match install_skill(primary, target) {
+        Ok(installed) => Ok((installed, primary)),
+        Err(err) if is_pinned_source(primary) && primary != fallback_source => {
+            anstream::eprintln!(
+                "knack sync: lockfile pin for `{skill_name}` is no longer reachable; \
+                 falling back to manifest source `{fallback_source}` ({err:#})"
+            );
+            let installed = install_skill(fallback_source, target).with_context(|| {
+                format!(
+                    "fallback install of `{skill_name}` from manifest source also failed \
+                     (the pinned lockfile ref was unreachable too)"
+                )
+            })?;
+            Ok((installed, fallback_source))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn install_skill(source: &str, target: &PathBuf) -> Result<InstalledSkill> {
