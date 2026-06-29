@@ -303,6 +303,8 @@ At startup, that materializes skills such as `tea:platform/agent-skills/deploy-c
 
 Dynamic sources must refresh successfully on startup before the registry serves traffic. After startup, the registry refreshes dynamic sources every 300 seconds by default and keeps serving the last good index if a later refresh fails. Disable background refresh with `--refresh-interval-seconds 0` or tune it with another interval.
 
+Pass `--cache-dir <path>` to keep the cloned backing repos across restarts. When set, refreshes do `git fetch + git reset --hard` against the existing clone instead of re-cloning, and archive requests read straight from the cache directory — no per-request git operations. Point it at a persistent volume (Fly.io Volume, EFS mount, GCP Cloud Run volume, anything that survives container restart) for the full benefit. When omitted, the registry uses a per-process tempdir that's rebuilt on every cold start — that's the right shape for ephemeral-filesystem platforms like Cloudflare Containers.
+
 Static entries are still supported for hand-curated overrides:
 
 ```toml

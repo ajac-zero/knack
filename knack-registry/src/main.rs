@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::File,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -67,15 +67,201 @@ struct Cli {
     /// Periodically refresh dynamic sources. Set to 0 to disable background refresh.
     #[arg(long, default_value_t = 300)]
     refresh_interval_seconds: u64,
+
+    /// Directory to persist cloned backing repos across refreshes and restarts.
+    /// When set, refreshes do `git fetch + reset` instead of re-cloning, and
+    /// archive requests read from the cache instead of cloning per request.
+    /// When omitted, a per-process tempdir is used (legacy behaviour; cache is
+    /// rebuilt on every restart). On a platform with persistent volumes
+    /// (Fly.io, AWS App Runner with EFS, GCP Cloud Run with a volume), point
+    /// this at a mounted volume to keep the cache across container restarts.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 struct AppState {
-    index: Arc<RwLock<RegistryIndex>>,
+    /// Combined search index + per-skill location pointer into the
+    /// cache. These two move together: a refresh swaps the whole
+    /// IndexedState under a single write lock, so any observer sees
+    /// either the old (index, locations) pair or the new one — never
+    /// a mix where a search hit references a stale cache entry.
+    state: Arc<RwLock<IndexedState>>,
     index_path: PathBuf,
     skills_root: Option<PathBuf>,
     name: Option<String>,
     source_aliases: BTreeMap<String, String>,
+}
+
+/// What the registry exposes to clients (`index`) plus how to actually
+/// produce each skill's tarball without doing more git work (`locations`).
+/// Built atomically by `refresh_index_and_cache`.
+#[derive(Debug, Default)]
+struct IndexedState {
+    index: RegistryIndex,
+    locations: HashMap<String, SkillLocation>,
+}
+
+/// Points at a specific skill inside a cached backing repo. `cached`
+/// is shared (Arc) so multiple skills from the same `[[source]]` entry
+/// reuse one clone, one refresh lock, and one captured SHA.
+#[derive(Debug, Clone)]
+struct SkillLocation {
+    cached: Arc<CachedSource>,
+    /// Path from `cached.repo_dir` to the skill directory. For a
+    /// dynamic `[[source]]` entry pointing at a whole repo (no
+    /// subpath), this might be e.g. `skills/pdf`. For a static
+    /// `[[skill]]` entry whose source already names a specific
+    /// skill, this is the same subpath used in the source URL.
+    relative: PathBuf,
+}
+
+/// A backing repo on disk that can be refreshed in place. The
+/// `refresh_lock` serialises in-place `git fetch + reset` against
+/// concurrent archive reads — readers (archive serving) take the
+/// read lock, the refresh task takes the write lock briefly while
+/// it mutates the working tree.
+#[derive(Debug)]
+struct CachedSource {
+    /// Stable directory on disk. We `git fetch + reset --hard` in
+    /// place rather than cloning into a new path; that lets us
+    /// reuse the cached objects across refreshes (pack-file deltas
+    /// instead of full clones) and means archive readers see a
+    /// stable path even while refreshes happen.
+    repo_dir: PathBuf,
+    /// HEAD SHA captured at the last successful refresh, exposed
+    /// via the `X-Knack-Resolved-Sha` archive response header.
+    sha: tokio::sync::RwLock<Option<String>>,
+    refresh_lock: tokio::sync::RwLock<()>,
+}
+
+/// Lazy, append-only map from source URL to its cached repo. Entries
+/// are created on first access (refresh) and stay until `prune_stale`
+/// removes those no longer referenced by the current index.
+#[derive(Debug)]
+struct SourceCache {
+    base_dir: PathBuf,
+    /// Held lock-free for reads; only acquired write when registering
+    /// a new entry. Once an Arc<CachedSource> is exposed, all
+    /// mutation goes through its own refresh_lock.
+    entries: std::sync::RwLock<HashMap<String, Arc<CachedSource>>>,
+    /// Owned tempdir kept alive for the SourceCache's lifetime so
+    /// that, when `--cache-dir` was omitted, the per-process scratch
+    /// directory is cleaned up at shutdown rather than leaking.
+    _tempdir: Option<tempfile::TempDir>,
+}
+
+impl SourceCache {
+    fn new(base_dir: PathBuf, tempdir: Option<tempfile::TempDir>) -> Result<Self> {
+        std::fs::create_dir_all(&base_dir)
+            .with_context(|| format!("failed to create cache dir {}", base_dir.display()))?;
+        Ok(Self {
+            base_dir,
+            entries: std::sync::RwLock::new(HashMap::new()),
+            _tempdir: tempdir,
+        })
+    }
+
+    /// Get an existing entry or register a fresh one. Doesn't touch
+    /// the filesystem beyond computing the subdir path — callers
+    /// invoke `refresh_cached_source` to actually populate it.
+    fn slot(&self, source: &str) -> Arc<CachedSource> {
+        if let Some(existing) = self.entries.read().unwrap().get(source) {
+            return existing.clone();
+        }
+        let mut guard = self.entries.write().unwrap();
+        if let Some(existing) = guard.get(source) {
+            return existing.clone();
+        }
+        let repo_dir = self.base_dir.join(cache_subdir_name(source));
+        let entry = Arc::new(CachedSource {
+            repo_dir,
+            sha: tokio::sync::RwLock::new(None),
+            refresh_lock: tokio::sync::RwLock::new(()),
+        });
+        guard.insert(source.to_string(), entry.clone());
+        entry
+    }
+
+    /// Remove cache entries (and their on-disk directories) whose
+    /// source URL isn't in `active`. Called at the end of each
+    /// refresh pass so an operator removing a `[[source]]` line
+    /// doesn't accumulate orphan clones.
+    ///
+    /// Cleans both the in-memory map (entries the current process
+    /// created) AND the on-disk base_dir (subdirs left behind by a
+    /// previous run whose `--index` listed sources we no longer
+    /// have). The on-disk sweep is what makes a persistent
+    /// `--cache-dir` self-healing across config changes.
+    fn prune_stale(&self, active: &BTreeSet<String>) {
+        let active_subdirs: BTreeSet<String> =
+            active.iter().map(|s| cache_subdir_name(s)).collect();
+
+        let mut guard = self.entries.write().unwrap();
+        let stale_keys: Vec<String> = guard
+            .keys()
+            .filter(|key| !active.contains(*key))
+            .cloned()
+            .collect();
+        for key in stale_keys {
+            if let Some(entry) = guard.remove(&key) {
+                if let Err(err) = std::fs::remove_dir_all(&entry.repo_dir) {
+                    eprintln!(
+                        "failed to remove stale cache dir {}: {err:#}",
+                        entry.repo_dir.display()
+                    );
+                }
+            }
+        }
+        drop(guard);
+
+        // Sweep on-disk orphans. A previous run with a different
+        // [[source]] set leaves subdirs that the in-memory map
+        // never knew about; without this sweep they'd persist
+        // forever in a long-lived persistent cache.
+        match std::fs::read_dir(&self.base_dir) {
+            Ok(iter) => {
+                for entry in iter.flatten() {
+                    let path = entry.path();
+                    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    if active_subdirs.contains(name) {
+                        continue;
+                    }
+                    if let Err(err) = std::fs::remove_dir_all(&path) {
+                        eprintln!(
+                            "failed to remove orphan cache dir {}: {err:#}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "failed to scan cache dir {} for orphans: {err:#}",
+                    self.base_dir.display()
+                );
+            }
+        }
+    }
+}
+
+/// Map a source URL onto a filename-safe subdirectory. Keeps the
+/// alphanumerics, replaces everything else with `_`. The result is
+/// stable across runs so the persistent cache identifies the same
+/// source consistently, but it's not collision-free — two sources
+/// differing only by punctuation would clash. The chance of that
+/// matters less than the legibility of the resulting paths when an
+/// operator inspects the cache dir manually.
+fn cache_subdir_name(source: &str) -> String {
+    source
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '.' => c,
+            _ => '_',
+        })
+        .collect()
 }
 
 /// Payload returned by GET /info so clients can self-configure on
@@ -96,9 +282,24 @@ struct SearchParams {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let source_aliases = parse_source_aliases(&cli.source_aliases)?;
-    let index = refresh_index(&cli.index, &source_aliases)?;
+
+    // Either the operator pointed us at a persistent volume (Fly.io
+    // / mounted PV / whatever) or we spin up a tempdir that lives
+    // for the process. The latter is the Cloudflare-Containers-style
+    // shape: cache benefits within a container's lifetime, rebuilt
+    // on every cold start.
+    let (cache_base, cache_tempdir) = match cli.cache_dir.clone() {
+        Some(path) => (path, None),
+        None => {
+            let tempdir = tempfile::tempdir().context("failed to create cache tempdir")?;
+            (tempdir.path().to_path_buf(), Some(tempdir))
+        }
+    };
+    let source_cache = Arc::new(SourceCache::new(cache_base, cache_tempdir)?);
+
+    let initial = refresh_index_and_cache(&cli.index, &source_aliases, &source_cache).await?;
     let state = AppState {
-        index: Arc::new(RwLock::new(index)),
+        state: Arc::new(RwLock::new(initial)),
         index_path: cli.index,
         skills_root: cli.skills_root,
         name: cli.name,
@@ -107,9 +308,10 @@ async fn main() -> Result<()> {
 
     if cli.refresh_interval_seconds > 0 {
         spawn_refresh_task(
-            state.index.clone(),
+            state.state.clone(),
             state.index_path.clone(),
             state.source_aliases.clone(),
+            source_cache,
             Duration::from_secs(cli.refresh_interval_seconds),
         );
     }
@@ -134,7 +336,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn read_index(path: &PathBuf) -> Result<RegistryIndex> {
+fn read_index(path: &Path) -> Result<RegistryIndex> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let index: RegistryIndex =
@@ -143,50 +345,71 @@ fn read_index(path: &PathBuf) -> Result<RegistryIndex> {
     Ok(index)
 }
 
-fn refresh_index(
-    path: &PathBuf,
+async fn refresh_index_and_cache(
+    path: &Path,
     source_aliases: &BTreeMap<String, String>,
-) -> Result<RegistryIndex> {
+    cache: &SourceCache,
+) -> Result<IndexedState> {
     let mut index = read_index(path)?;
-    materialize_dynamic_sources(&mut index, source_aliases)?;
-    Ok(index)
-}
+    let mut locations: HashMap<String, SkillLocation> = HashMap::new();
+    let mut active_sources: BTreeSet<String> = BTreeSet::new();
 
-fn spawn_refresh_task(
-    index: Arc<RwLock<RegistryIndex>>,
-    index_path: PathBuf,
-    source_aliases: BTreeMap<String, String>,
-    interval: Duration,
-) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            match refresh_index(&index_path, &source_aliases) {
-                Ok(refreshed) => {
-                    let mut index = index.write().await;
-                    *index = refreshed;
-                    eprintln!("refreshed knack registry index");
-                }
-                Err(error) => {
-                    eprintln!("failed to refresh knack registry index: {error:#}");
-                }
-            }
+    // Static [[skill]] entries first so they win name collisions
+    // against dynamic walks — an operator that pinned a specific
+    // skill by hand presumably did so deliberately.
+    for skill in index.skill.clone() {
+        active_sources.insert(skill.source.clone());
+        let cached = cache.slot(&skill.source);
+        if let Err(err) = refresh_cached_source(&cached, &skill.source, source_aliases).await {
+            eprintln!(
+                "failed to refresh static entry {} from {}: {err:#}",
+                skill.name, skill.source
+            );
+            continue;
         }
-    });
-}
+        let relative = source_subpath(&skill.source, source_aliases).unwrap_or_default();
+        let skill_md = cached.repo_dir.join(&relative).join("SKILL.md");
+        if !skill_md.is_file() {
+            eprintln!(
+                "static skill {} has no SKILL.md at {}",
+                skill.name,
+                skill_md.display()
+            );
+            continue;
+        }
+        locations.insert(
+            skill.name.clone(),
+            SkillLocation {
+                cached: cached.clone(),
+                relative,
+            },
+        );
+    }
 
-fn materialize_dynamic_sources(
-    index: &mut RegistryIndex,
-    source_aliases: &BTreeMap<String, String>,
-) -> Result<()> {
-    let static_skill_names: Vec<String> =
+    let static_skill_names: BTreeSet<String> =
         index.skill.iter().map(|skill| skill.name.clone()).collect();
     let dynamic_sources = index.source.clone();
     for source in dynamic_sources {
-        let fetched = fetch_source_root(&source.source, source_aliases)?;
-        for skill_dir in collect_skill_dirs(&fetched.path)? {
+        active_sources.insert(source.source.clone());
+        let cached = cache.slot(&source.source);
+        if let Err(err) = refresh_cached_source(&cached, &source.source, source_aliases).await {
+            eprintln!(
+                "failed to refresh dynamic source {}: {err:#}",
+                source.source
+            );
+            continue;
+        }
+        let subpath = source_subpath(&source.source, source_aliases).unwrap_or_default();
+        let walk_root = cached.repo_dir.join(&subpath);
+
+        let skill_dirs = match collect_skill_dirs(&walk_root) {
+            Ok(dirs) => dirs,
+            Err(err) => {
+                eprintln!("failed to walk {} for skills: {err:#}", walk_root.display());
+                continue;
+            }
+        };
+        for skill_dir in skill_dirs {
             // One malformed SKILL.md inside a multi-skill repo (an
             // un-filled template, a name/dir mismatch, an empty
             // description) used to kill the entire materialize pass
@@ -208,24 +431,37 @@ fn materialize_dynamic_sources(
                 eprintln!("skipping {}: {err:#}", skill_dir.display());
                 continue;
             }
-            if static_skill_names.iter().any(|name| name == &skill.name)
+            if static_skill_names.contains(&skill.name)
+                || locations.contains_key(&skill.name)
                 || index.skill.iter().any(|indexed| indexed.name == skill.name)
             {
                 continue;
             }
-            let relative = skill_dir.strip_prefix(&fetched.path).with_context(|| {
+            let relative_to_walk = skill_dir.strip_prefix(&walk_root).with_context(|| {
                 format!(
                     "failed to make {} relative to {}",
                     skill_dir.display(),
-                    fetched.path.display()
+                    walk_root.display()
                 )
             })?;
-            let relative = relative.to_string_lossy().replace('\\', "/");
-            let skill_source = if relative.is_empty() {
+            let relative_for_url = relative_to_walk.to_string_lossy().replace('\\', "/");
+            let skill_source = if relative_for_url.is_empty() {
                 source.source.clone()
             } else {
-                format!("{}/{}", source.source.trim_end_matches('/'), relative)
+                format!(
+                    "{}/{}",
+                    source.source.trim_end_matches('/'),
+                    relative_for_url
+                )
             };
+            let relative_to_repo = subpath.join(relative_to_walk);
+            locations.insert(
+                skill.name.clone(),
+                SkillLocation {
+                    cached: cached.clone(),
+                    relative: relative_to_repo,
+                },
+            );
             index.skill.push(IndexedSkill {
                 name: skill.name,
                 description: skill.description,
@@ -238,7 +474,38 @@ fn materialize_dynamic_sources(
         .skill
         .sort_by(|left, right| left.name.cmp(&right.name));
     index.validate()?;
-    Ok(())
+
+    // Drop cache entries (and their on-disk dirs) for sources the
+    // operator removed since the last refresh. Bounded growth.
+    cache.prune_stale(&active_sources);
+
+    Ok(IndexedState { index, locations })
+}
+
+fn spawn_refresh_task(
+    state: Arc<RwLock<IndexedState>>,
+    index_path: PathBuf,
+    source_aliases: BTreeMap<String, String>,
+    cache: Arc<SourceCache>,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match refresh_index_and_cache(&index_path, &source_aliases, &cache).await {
+                Ok(refreshed) => {
+                    let mut guard = state.write().await;
+                    *guard = refreshed;
+                    eprintln!("refreshed knack registry index");
+                }
+                Err(error) => {
+                    eprintln!("failed to refresh knack registry index: {error:#}");
+                }
+            }
+        }
+    });
 }
 
 fn collect_skill_dirs(root: &Path) -> Result<Vec<PathBuf>> {
@@ -286,16 +553,17 @@ async fn info(State(state): State<AppState>) -> Json<RegistryInfo> {
 }
 
 async fn get_index(State(state): State<AppState>) -> Json<RegistryIndex> {
-    Json(state.index.read().await.clone())
+    Json(state.state.read().await.index.clone())
 }
 
 async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> Json<Vec<IndexedSkill>> {
-    let index = state.index.read().await;
-    let mut results: Vec<IndexedSkill> = index.search(&params.q).into_iter().cloned().collect();
-    drop(index);
+    let guard = state.state.read().await;
+    let mut results: Vec<IndexedSkill> =
+        guard.index.search(&params.q).into_iter().cloned().collect();
+    drop(guard);
     if let Some(name) = &state.name {
         for skill in &mut results {
             skill.source = format!("{}:{}", name, skill.name);
@@ -356,18 +624,26 @@ async fn create_skill_archive(state: &AppState, name: &str) -> Result<SkillArchi
         }
     }
 
-    let index = state.index.read().await;
-    let source = index
-        .skill
-        .iter()
-        .find(|skill| skill.name == name)
-        .map(|skill| skill.source.clone())
-        .with_context(|| format!("skill not found: {name}"))?;
-    drop(index);
-    let fetched = fetch_backing_source(&source, state)?;
+    let location = {
+        let guard = state.state.read().await;
+        guard
+            .locations
+            .get(name)
+            .cloned()
+            .with_context(|| format!("skill not found: {name}"))?
+    };
+
+    // Hold the cached source's refresh-read lock while we tar the
+    // skill directory. If a background refresh is in progress for
+    // this source, it acquired the corresponding write lock and we
+    // wait briefly — that's better than letting the refresh truncate
+    // the working tree out from under us mid-archive.
+    let _read_guard = location.cached.refresh_lock.read().await;
+    let resolved_sha = location.cached.sha.read().await.clone();
+    let skill_dir = location.cached.repo_dir.join(&location.relative);
     Ok(SkillArchive {
-        bytes: create_skill_archive_from_dir(&fetched.path)?,
-        resolved_sha: fetched.resolved_sha,
+        bytes: create_skill_archive_from_dir(&skill_dir)?,
+        resolved_sha,
     })
 }
 
@@ -394,40 +670,25 @@ fn create_skill_archive_from_dir(skill_dir: &Path) -> Result<Vec<u8>> {
     Ok(encoder.finish()?)
 }
 
+/// Decomposed backing-source URL: where to clone from, which ref to
+/// pin to, and which subdir within the repo is being targeted (empty
+/// when the whole repo is in scope). Same shape for `gh:` and
+/// `alias:` sources.
 #[derive(Debug)]
-struct FetchedBackingSource {
-    path: PathBuf,
-    _temp_dir: tempfile::TempDir,
-    /// Commit SHA captured from `git rev-parse HEAD` in the cloned
-    /// backing repo. Surfaced to clients via the X-Knack-Resolved-Sha
-    /// response header so they can pin their lockfiles to specific
-    /// content. None when capture fails (treated as 'no SHA available').
-    resolved_sha: Option<String>,
+struct ParsedSource {
+    repo_url: String,
+    reference: String,
+    subpath: PathBuf,
 }
 
-fn fetch_backing_source(source: &str, state: &AppState) -> Result<FetchedBackingSource> {
-    fetch_source_root(source, &state.source_aliases).and_then(|fetched| {
-        let skill = read_skill(&fetched.path)?;
-        validate_skill_metadata(&skill)?;
-        Ok(fetched)
-    })
-}
-
-fn fetch_source_root(
-    source: &str,
-    source_aliases: &BTreeMap<String, String>,
-) -> Result<FetchedBackingSource> {
-    // gh: sources resolve directly against github.com without needing
-    // an operator-configured alias. Lets the registry serve any public
-    // GitHub skill repo from its `[[source]]` entries, which is the
-    // common shape for a public-curated index.
+fn parse_source(source: &str, source_aliases: &BTreeMap<String, String>) -> Result<ParsedSource> {
     if let Some(spec) = source.strip_prefix("gh:") {
         let github = parse_github_spec_for_registry(spec)?;
-        return clone_backing_source(
-            &format!("https://github.com/{}/{}.git", github.owner, github.repo),
-            &github.reference,
-            &github.skill_path,
-        );
+        return Ok(ParsedSource {
+            repo_url: format!("https://github.com/{}/{}.git", github.owner, github.repo),
+            reference: github.reference,
+            subpath: github.skill_path,
+        });
     }
 
     let (alias, rest) = source
@@ -440,65 +701,131 @@ fn fetch_source_root(
         )
     })?;
     let git = parse_git_host_source(base_url, rest)?;
-    clone_backing_source(&git.repo_url, &git.reference, &git.skill_path)
+    Ok(ParsedSource {
+        repo_url: git.repo_url,
+        reference: git.reference,
+        subpath: git.skill_path,
+    })
 }
 
-/// Clone the backing repo into a fresh tempdir and return the
-/// resolved skill subdirectory plus HEAD SHA. When `skill_path`
-/// is non-empty we try a partial+sparse clone so only blobs under
-/// the requested subpath are pulled — this is what keeps indexing
-/// a one-skill subdirectory of a monorepo (e.g.
-/// `gh:shadcn-ui/ui/skills`) from downloading hundreds of MB of
-/// unrelated app/package code on every refresh.
-///
-/// Partial clone (`--filter=blob:none`) requires server-side
-/// support via `uploadpack.allowFilter=true`. GitHub has it on
-/// for all public repos; modern Gitea and GitLab do too. If a
-/// host doesn't, we fall back transparently to a full shallow
-/// clone — correctness is preserved, the bandwidth win is lost.
-fn clone_backing_source(
-    repo_url: &str,
-    reference: &str,
-    skill_path: &Path,
-) -> Result<FetchedBackingSource> {
-    let temp_dir = tempfile::tempdir().context("failed to create temporary directory")?;
-    let repo_dir = temp_dir.path().join("repo");
+/// Returns the subpath component of a backing source (empty if
+/// none). Convenience wrapper around `parse_source` for callers
+/// that only need to know which subdir of a cached repo to look at.
+fn source_subpath(source: &str, source_aliases: &BTreeMap<String, String>) -> Result<PathBuf> {
+    Ok(parse_source(source, source_aliases)?.subpath)
+}
 
-    let subpath = skill_path.to_str().unwrap_or("");
-    let sparse_ok = if subpath.is_empty() {
-        false
-    } else {
-        match sparse_clone(repo_url, reference, subpath, &repo_dir) {
-            Ok(()) => true,
+/// Bring `cached.repo_dir` up to date with the current `<ref>` of
+/// `source`. If the cache already has a usable clone, we do
+/// `git fetch + git reset --hard FETCH_HEAD` against it — that
+/// transfers pack-file deltas, typically a few KB. If no clone
+/// exists yet, or an in-place fetch fails (force-push that rewrote
+/// history, corrupted cache, etc.), we fall back to a fresh sparse
+/// or full clone into the same directory.
+///
+/// The whole operation is serialised against archive readers via
+/// `refresh_lock`. After success, the new HEAD SHA is published
+/// under `cached.sha` so the next archive response advertises it
+/// in the `X-Knack-Resolved-Sha` header.
+async fn refresh_cached_source(
+    cached: &CachedSource,
+    source: &str,
+    source_aliases: &BTreeMap<String, String>,
+) -> Result<()> {
+    let _write_guard = cached.refresh_lock.write().await;
+    let parsed = parse_source(source, source_aliases)?;
+    let has_git = cached.repo_dir.join(".git").is_dir();
+
+    if has_git {
+        match incremental_fetch(&cached.repo_dir, &parsed.reference) {
+            Ok(()) => {}
             Err(err) => {
                 eprintln!(
-                    "sparse clone of {repo_url} at {reference} (subpath {subpath}) failed, \
-                     falling back to full clone: {err:#}"
+                    "incremental refresh of {source} failed ({err:#}), \
+                     rebuilding from scratch"
                 );
-                false
+                if cached.repo_dir.exists() {
+                    std::fs::remove_dir_all(&cached.repo_dir).with_context(|| {
+                        format!(
+                            "failed to remove stale cache dir {}",
+                            cached.repo_dir.display()
+                        )
+                    })?;
+                }
+                clone_into_cache_dir(&parsed, &cached.repo_dir)?;
             }
         }
-    };
-
-    if !sparse_ok {
-        if repo_dir.exists() {
-            std::fs::remove_dir_all(&repo_dir).with_context(|| {
+    } else {
+        // First-time fetch (cache empty for this source) or partial
+        // state left over from an aborted previous attempt.
+        if cached.repo_dir.exists() {
+            std::fs::remove_dir_all(&cached.repo_dir).with_context(|| {
                 format!(
-                    "failed to remove partial clone at {} before fallback",
-                    repo_dir.display()
+                    "failed to remove partial cache dir {}",
+                    cached.repo_dir.display()
                 )
             })?;
         }
-        full_clone(repo_url, reference, &repo_dir)?;
+        clone_into_cache_dir(&parsed, &cached.repo_dir)?;
     }
 
-    let resolved_sha = capture_git_head_sha(&repo_dir).ok();
-    let skill_dir = repo_dir.join(skill_path);
-    Ok(FetchedBackingSource {
-        path: skill_dir,
-        _temp_dir: temp_dir,
-        resolved_sha,
-    })
+    let sha = capture_git_head_sha(&cached.repo_dir).ok();
+    *cached.sha.write().await = sha;
+    Ok(())
+}
+
+fn incremental_fetch(repo_dir: &Path, reference: &str) -> Result<()> {
+    run_git(
+        ["fetch", "--depth=1", "origin", reference],
+        Some(repo_dir),
+        "incremental fetch",
+    )?;
+    run_git(
+        ["reset", "--hard", "FETCH_HEAD"],
+        Some(repo_dir),
+        "reset to fetched head",
+    )?;
+    // Drop any unreferenced objects accumulated across refreshes
+    // so the cache doesn't grow unboundedly. Best-effort; ignore
+    // errors so a transient git failure here doesn't block serving.
+    let _ = run_git(
+        ["gc", "--auto"],
+        Some(repo_dir),
+        "auto gc after incremental fetch",
+    );
+    Ok(())
+}
+
+/// Initial population (or rebuild) of a cache entry's working tree.
+/// When the source specifies a subpath we use partial+sparse clone
+/// (only blobs we'll actually checkout get transferred); for whole-
+/// repo sources we use a plain shallow clone. Partial clone needs
+/// `uploadpack.allowFilter=true` on the server — GitHub and modern
+/// Gitea/GitLab have it. If the host rejects the partial flags we
+/// fall back transparently to a full shallow clone.
+fn clone_into_cache_dir(parsed: &ParsedSource, repo_dir: &Path) -> Result<()> {
+    let subpath = parsed.subpath.to_str().unwrap_or("");
+    if !subpath.is_empty() {
+        match sparse_clone(&parsed.repo_url, &parsed.reference, subpath, repo_dir) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                eprintln!(
+                    "sparse clone of {} at {} (subpath {subpath}) failed, \
+                     falling back to full clone: {err:#}",
+                    parsed.repo_url, parsed.reference
+                );
+                if repo_dir.exists() {
+                    std::fs::remove_dir_all(repo_dir).with_context(|| {
+                        format!(
+                            "failed to remove partial clone at {} before fallback",
+                            repo_dir.display()
+                        )
+                    })?;
+                }
+            }
+        }
+    }
+    full_clone(&parsed.repo_url, &parsed.reference, repo_dir)
 }
 
 fn sparse_clone(repo_url: &str, reference: &str, subpath: &str, repo_dir: &Path) -> Result<()> {
