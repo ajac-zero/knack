@@ -187,8 +187,27 @@ fn materialize_dynamic_sources(
     for source in dynamic_sources {
         let fetched = fetch_source_root(&source.source, source_aliases)?;
         for skill_dir in collect_skill_dirs(&fetched.path)? {
-            let skill = read_skill(&skill_dir)?;
-            validate_skill(&skill)?;
+            // One malformed SKILL.md inside a multi-skill repo (an
+            // un-filled template, a name/dir mismatch, an empty
+            // description) used to kill the entire materialize pass
+            // and prevent the registry from starting. That's too
+            // strict when the operator is pointing at a third-party
+            // repo they don't control. Skip the bad skill, surface
+            // the reason on stderr, and keep going.
+            let skill = match read_skill(&skill_dir) {
+                Ok(skill) => skill,
+                Err(err) => {
+                    eprintln!(
+                        "skipping {}: failed to read SKILL.md: {err:#}",
+                        skill_dir.display()
+                    );
+                    continue;
+                }
+            };
+            if let Err(err) = validate_skill(&skill) {
+                eprintln!("skipping {}: {err:#}", skill_dir.display());
+                continue;
+            }
             if static_skill_names.iter().any(|name| name == &skill.name)
                 || index.skill.iter().any(|indexed| indexed.name == skill.name)
             {
