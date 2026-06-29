@@ -80,8 +80,41 @@ fn parse_frontmatter(contents: &str) -> Result<SkillFrontmatter> {
     bail!("SKILL.md frontmatter is missing closing ---");
 }
 
-pub fn validate_skill(skill: &Skill) -> Result<()> {
+/// Validate a skill's identity (name well-formed, description present)
+/// without requiring the on-disk directory to match the frontmatter
+/// name. Use this when reading skills from an upstream source whose
+/// layout we don't control — e.g. when materialising a registry's
+/// dynamic `[[source]]` entries against third-party repos. Vendors
+/// commonly use unprefixed directory names with brand-prefixed
+/// frontmatter names (e.g. `skills/composition-patterns/` containing
+/// `name: vercel-composition-patterns`); that's a legitimate
+/// convention and the registry's archive flow already renames on
+/// the way out using the frontmatter name.
+pub fn validate_skill_metadata(skill: &Skill) -> Result<()> {
     validate_skill_name(&skill.name)?;
+
+    if skill.description.trim().is_empty() {
+        bail!("description must not be empty");
+    }
+
+    // We previously rejected descriptions over 1024 characters, but
+    // real-world Agent Skills (notably anthropics/skills) include
+    // multi-paragraph "use when..." prose well past that ceiling
+    // (skill-creator runs to ~5200 chars). knack should not gatekeep
+    // the format the broader ecosystem uses; UIs are free to truncate
+    // long descriptions at display time. Required fields stay strict.
+
+    Ok(())
+}
+
+/// Strict validation for skills installed locally or being authored.
+/// In addition to the metadata checks, the on-disk directory name
+/// must match the frontmatter name — this is a local-filesystem
+/// invariant for `.agents/skills/<name>/` lookup. Use this from
+/// `knack install`, `knack new`, `knack validate`, and the publish
+/// flow.
+pub fn validate_skill(skill: &Skill) -> Result<()> {
+    validate_skill_metadata(skill)?;
 
     let dirname = skill
         .path
@@ -95,17 +128,6 @@ pub fn validate_skill(skill: &Skill) -> Result<()> {
             dirname
         );
     }
-
-    if skill.description.trim().is_empty() {
-        bail!("description must not be empty");
-    }
-
-    // We previously rejected descriptions over 1024 characters, but
-    // real-world Agent Skills (notably anthropics/skills) include
-    // multi-paragraph "use when..." prose well past that ceiling
-    // (skill-creator runs to ~5200 chars). knack should not gatekeep
-    // the format the broader ecosystem uses; UIs are free to truncate
-    // long descriptions at display time. Required fields stay strict.
 
     Ok(())
 }
@@ -409,6 +431,23 @@ mod tests {
         // Removing deny_unknown_fields shouldn't make typos in REQUIRED
         // fields silent. Missing `description` should still fail.
         assert!(parse_frontmatter("---\nname: x\ndesciption: oops\n---\n").is_err());
+    }
+
+    #[test]
+    fn validate_skill_metadata_ignores_directory_mismatch() {
+        // Vendors like Vercel and Remotion use unprefixed dirs with
+        // brand-prefixed frontmatter names — e.g.
+        // skills/composition-patterns/SKILL.md whose frontmatter
+        // declares `name: vercel-composition-patterns`. That's a
+        // legitimate convention and a registry indexing them must
+        // not reject these. validate_skill (strict) still does.
+        let skill = Skill {
+            path: PathBuf::from("/tmp/composition-patterns"),
+            name: "vercel-composition-patterns".to_string(),
+            description: "React composition patterns.".to_string(),
+        };
+        assert!(validate_skill_metadata(&skill).is_ok());
+        assert!(validate_skill(&skill).is_err());
     }
 
     #[test]

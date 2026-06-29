@@ -31,7 +31,7 @@ const HELP_STYLES: Styles = Styles::styled()
     .valid(AnsiColor::Green.on_default())
     .invalid(AnsiColor::Yellow.on_default());
 use flate2::{Compression, write::GzEncoder};
-use knack_core::{IndexedSkill, RegistryIndex, collect_files, read_skill, validate_skill};
+use knack_core::{IndexedSkill, RegistryIndex, collect_files, read_skill, validate_skill_metadata};
 use serde::Deserialize;
 use tar::{Builder, Header};
 use tokio::sync::RwLock;
@@ -204,7 +204,7 @@ fn materialize_dynamic_sources(
                     continue;
                 }
             };
-            if let Err(err) = validate_skill(&skill) {
+            if let Err(err) = validate_skill_metadata(&skill) {
                 eprintln!("skipping {}: {err:#}", skill_dir.display());
                 continue;
             }
@@ -373,7 +373,7 @@ async fn create_skill_archive(state: &AppState, name: &str) -> Result<SkillArchi
 
 fn create_skill_archive_from_dir(skill_dir: &Path) -> Result<Vec<u8>> {
     let skill = read_skill(skill_dir)?;
-    validate_skill(&skill)?;
+    validate_skill_metadata(&skill)?;
 
     let buffer = Vec::new();
     let encoder = GzEncoder::new(buffer, Compression::default());
@@ -408,7 +408,7 @@ struct FetchedBackingSource {
 fn fetch_backing_source(source: &str, state: &AppState) -> Result<FetchedBackingSource> {
     fetch_source_root(source, &state.source_aliases).and_then(|fetched| {
         let skill = read_skill(&fetched.path)?;
-        validate_skill(&skill)?;
+        validate_skill_metadata(&skill)?;
         Ok(fetched)
     })
 }
