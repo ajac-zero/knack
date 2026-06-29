@@ -26,7 +26,9 @@ Compared to running the live `knack-registry serve`:
   at every PoP; users worldwide get sub-100ms responses.
 - Refresh latency = your cron interval, not the live registry's
   `--refresh-interval-seconds`. For a curated public registry where
-  skills don't change minute-by-minute, hourly cron is fine.
+  skills don't change minute-by-minute, daily cron is plenty (this
+  example uses 06:00 UTC). Bump cadence per your taste; this is the
+  one knob that costs nothing to change.
 
 The live shape stays the right choice for internal registries
 (private sources, auth, sub-minute publish-and-test loop). They're
@@ -35,7 +37,7 @@ complementary, not competing.
 ## Deployment flow
 
 ```
-   ┌──────────────────┐       hourly cron       ┌────────────────┐
+   ┌──────────────────┐       daily cron        ┌────────────────┐
    │  knack repo +    │ ──────────────────────▶ │  build job     │
    │  registries/*.toml│   (GitHub Actions /     │ knack-registry │
    └──────────────────┘    self-hosted runner)   │ build-static   │
@@ -83,7 +85,7 @@ cargo run --release -p knack-registry -- \
     build-static \
         --index registries/public.toml \
         --output ./dist \
-        --name knackpub
+        --name public
 
 # 2. Upload to R2. The bucket's existing contents are overwritten.
 #    (The Worker uses fresh lookups, no per-key purge needed.)
@@ -107,7 +109,7 @@ R2 endpoint — left as an exercise depending on your CI choice.
 name: Publish public registry
 on:
   schedule:
-    - cron: '0 * * * *'           # hourly
+    - cron: '0 6 * * *'           # daily at 06:00 UTC
   workflow_dispatch:               # also allow manual runs
 
 jobs:
@@ -127,7 +129,7 @@ jobs:
       - run: ./target/release/knack-registry build-static
               --index registries/public.toml
               --output ./dist
-              --name knackpub
+              --name public
       # Use wrangler in CI (assumes you've set CLOUDFLARE_API_TOKEN
       # and CLOUDFLARE_ACCOUNT_ID as secrets).
       - run: npm install -g wrangler
@@ -147,18 +149,22 @@ jobs:
 
 ## Verifying the deployed registry
 
+This repo's deployment lives at https://knack.ajac-zero.com — replace
+that with your own domain when verifying a fork. Registry name is
+`public` (set via `--name` on the build-static job).
+
 ```bash
 # Pretend to be the knack CLI.
-curl https://your-worker-domain/info
-curl https://your-worker-domain/index | jq '.skill | length'
-curl 'https://your-worker-domain/search?q=pdf' | jq
-curl -D - https://your-worker-domain/skills/pdf/archive -o /tmp/pdf.tgz | grep -i x-knack
+curl https://knack.ajac-zero.com/info
+curl https://knack.ajac-zero.com/index | jq '.skill | length'
+curl 'https://knack.ajac-zero.com/search?q=pdf' | jq
+curl -D - https://knack.ajac-zero.com/skills/pdf/archive -o /tmp/pdf.tgz | grep -i x-knack
 tar -tzf /tmp/pdf.tgz | head
 
 # Or use the actual CLI.
-knack registry add https://your-worker-domain
+knack registry add https://knack.ajac-zero.com
 knack find pdf
-knack add knackpub:pdf
+knack add public:pdf
 ```
 
 ## What this Worker does NOT do

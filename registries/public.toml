@@ -4,7 +4,7 @@
 # instance maintained by the knack project. Mirror it for your own
 # registry, or fork & extend with internal sources:
 #
-#   knack-registry --index registries/public.toml --name knackpub \
+#   knack-registry --index registries/public.toml --name public \
 #                  --refresh-interval-seconds 3600 --bind 0.0.0.0:7349
 #
 # `gh:` sources resolve directly against github.com and need no

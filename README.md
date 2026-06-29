@@ -313,12 +313,12 @@ For a public, read-mostly registry, the cheapest shape is to skip running a live
 knack-registry build-static \
     --index registries/public.toml \
     --output ./dist \
-    --name knackpub
+    --name public
 ```
 
-This produces `info.json`, `index.json`, `sha-map.json`, and one `skills/<name>.skill.tar.gz` per indexed skill. The output is everything a knack CLI client needs; an edge function in front of the bucket maps the four CLI endpoints (`/info`, `/index`, `/search`, `/skills/<name>/archive`) onto these files. See [`examples/cloudflare-worker/`](examples/cloudflare-worker/) for a working Worker + R2 setup with an hourly GitHub Actions cron, free-tier-friendly at the scale of the public registry (~200 skills, single-digit thousands of requests/day).
+This produces `info.json`, `index.json`, `sha-map.json`, and one `skills/<name>.skill.tar.gz` per indexed skill. The output is everything a knack CLI client needs; an edge function in front of the bucket maps the four CLI endpoints (`/info`, `/index`, `/search`, `/skills/<name>/archive`) onto these files. See [`examples/cloudflare-worker/`](examples/cloudflare-worker/) for a working Worker + R2 setup with a daily GitHub Actions cron, free-tier-friendly at the scale of the public registry (~200 skills, single-digit thousands of requests/day).
 
-Tradeoff: refresh granularity drops from `--refresh-interval-seconds` (default 300s) to whatever your cron interval is (typically 1h). Static loses dynamic queries, auth, and the ability to index private sources — keep `knack-registry serve` for internal team registries where any of those matter.
+Tradeoff: refresh granularity drops from `--refresh-interval-seconds` (default 300s) to whatever your cron interval is (daily for the public registry). Static loses dynamic queries, auth, and the ability to index private sources — keep `knack-registry serve` for internal team registries where any of those matter.
 
 Static entries are still supported for hand-curated overrides:
 

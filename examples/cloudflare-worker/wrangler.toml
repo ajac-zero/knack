@@ -12,7 +12,9 @@ bucket_name = "knack-registry-public"
 
 # Optional: route the worker at a custom domain. Set up the route in
 # Cloudflare's dashboard or via `wrangler.toml`'s [[routes]] block.
+# Below is the route used by the ajac-zero deployment of this repo;
+# swap the pattern for your own domain when forking.
 #
 # [[routes]]
-# pattern = "registry.knack.dev"
+# pattern = "knack.ajac-zero.com"
 # custom_domain = true

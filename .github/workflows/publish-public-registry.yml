@@ -1,0 +1,99 @@
+name: Publish public registry
+
+# Materialises registries/public.toml into a static snapshot and
+# uploads it to Cloudflare R2, where the Worker in
+# examples/cloudflare-worker/ serves it at https://knack.ajac-zero.com.
+#
+# Runs daily by default. Use the workflow_dispatch trigger to force
+# an immediate rebuild (e.g. after merging a PR that edits
+# registries/public.toml).
+#
+# Required repository secrets:
+#   CLOUDFLARE_API_TOKEN  - token with "Workers R2 Storage: Edit" scope
+#                           on the relevant account
+#   CLOUDFLARE_ACCOUNT_ID - the Cloudflare account ID hosting the bucket
+#
+# The Worker itself (which serves these files) is deployed separately
+# and ONCE — see examples/cloudflare-worker/README.md for that flow.
+# This workflow only refreshes the static content the Worker reads.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'      # daily at 06:00 UTC
+  workflow_dispatch:           # also allow manual / on-demand runs
+
+# Only one publish at a time. If a manual run kicks off while the cron
+# is mid-flight, it'll queue.
+concurrency:
+  group: publish-public-registry
+  cancel-in-progress: false
+
+# Restrict to the upstream owner. Forks running their own deployment
+# can fork-and-override but the default-on cron shouldn't fire there.
+jobs:
+  publish:
+    if: github.repository_owner == 'ajac-zero'
+    name: build and upload
+    runs-on: ubuntu-latest
+    env:
+      BUCKET_NAME: knack-registry-public
+      REGISTRY_NAME: public
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Share the cache with CI's caches for the same lockfile.
+          shared-key: registry-release
+
+      - name: Build knack-registry (release)
+        run: cargo build --release --locked -p knack-registry
+
+      - name: Materialise static snapshot
+        run: |
+          ./target/release/knack-registry build-static \
+              --index registries/public.toml \
+              --output ./dist \
+              --name "${REGISTRY_NAME}"
+          echo "snapshot built:"
+          ls -lh dist/
+          echo "archive count: $(ls dist/skills | wc -l)"
+          echo "total size: $(du -sh dist | cut -f1)"
+
+      - name: Install wrangler
+        run: npm install --global wrangler@4
+
+      - name: Upload snapshot to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          cd dist
+
+          # The three top-level JSON files. Tiny, sequential is fine.
+          for file in info.json index.json sha-map.json; do
+              echo "uploading ${file}..."
+              wrangler r2 object put \
+                  "${BUCKET_NAME}/${file}" \
+                  --file="${file}" \
+                  --content-type=application/json \
+                  --remote
+          done
+
+          # The per-skill tarballs. Parallelise so the run completes
+          # in well under a minute even with hundreds of archives.
+          # -P 8 is plenty for wrangler+R2 from a GitHub runner; bump
+          # if upload time becomes the bottleneck.
+          export BUCKET_NAME
+          find skills -type f -name '*.skill.tar.gz' -print0 \
+              | xargs -0 -P 8 -I {} \
+                  wrangler r2 object put \
+                      "${BUCKET_NAME}/{}" \
+                      --file="{}" \
+                      --content-type=application/gzip \
+                      --remote
+
+          echo "uploaded $(find skills -type f -name '*.skill.tar.gz' | wc -l) tarballs"
