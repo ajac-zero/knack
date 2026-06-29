@@ -443,10 +443,19 @@ fn fetch_source_root(
     clone_backing_source(&git.repo_url, &git.reference, &git.skill_path)
 }
 
-/// Shallow-clone `repo_url` at `reference` into a fresh tempdir and
-/// return the resolved skill directory plus the cloned-HEAD SHA.
-/// Shared by both the alias-based and `gh:` paths so SHA capture
-/// stays identical across source schemes.
+/// Clone the backing repo into a fresh tempdir and return the
+/// resolved skill subdirectory plus HEAD SHA. When `skill_path`
+/// is non-empty we try a partial+sparse clone so only blobs under
+/// the requested subpath are pulled — this is what keeps indexing
+/// a one-skill subdirectory of a monorepo (e.g.
+/// `gh:shadcn-ui/ui/skills`) from downloading hundreds of MB of
+/// unrelated app/package code on every refresh.
+///
+/// Partial clone (`--filter=blob:none`) requires server-side
+/// support via `uploadpack.allowFilter=true`. GitHub has it on
+/// for all public repos; modern Gitea and GitLab do too. If a
+/// host doesn't, we fall back transparently to a full shallow
+/// clone — correctness is preserved, the bandwidth win is lost.
 fn clone_backing_source(
     repo_url: &str,
     reference: &str,
@@ -454,6 +463,75 @@ fn clone_backing_source(
 ) -> Result<FetchedBackingSource> {
     let temp_dir = tempfile::tempdir().context("failed to create temporary directory")?;
     let repo_dir = temp_dir.path().join("repo");
+
+    let subpath = skill_path.to_str().unwrap_or("");
+    let sparse_ok = if subpath.is_empty() {
+        false
+    } else {
+        match sparse_clone(repo_url, reference, subpath, &repo_dir) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!(
+                    "sparse clone of {repo_url} at {reference} (subpath {subpath}) failed, \
+                     falling back to full clone: {err:#}"
+                );
+                false
+            }
+        }
+    };
+
+    if !sparse_ok {
+        if repo_dir.exists() {
+            std::fs::remove_dir_all(&repo_dir).with_context(|| {
+                format!(
+                    "failed to remove partial clone at {} before fallback",
+                    repo_dir.display()
+                )
+            })?;
+        }
+        full_clone(repo_url, reference, &repo_dir)?;
+    }
+
+    let resolved_sha = capture_git_head_sha(&repo_dir).ok();
+    let skill_dir = repo_dir.join(skill_path);
+    Ok(FetchedBackingSource {
+        path: skill_dir,
+        _temp_dir: temp_dir,
+        resolved_sha,
+    })
+}
+
+fn sparse_clone(repo_url: &str, reference: &str, subpath: &str, repo_dir: &Path) -> Result<()> {
+    let repo_dir_str = repo_dir.to_str().unwrap_or_default();
+    let action = format!("sparse-clone {repo_url} at ref {reference}");
+    run_git(
+        [
+            "clone",
+            "--no-checkout",
+            "--filter=blob:none",
+            "--depth=1",
+            "--branch",
+            reference,
+            "--sparse",
+            repo_url,
+            repo_dir_str,
+        ],
+        None,
+        &action,
+    )?;
+    run_git(
+        ["sparse-checkout", "set", subpath],
+        Some(repo_dir),
+        "configure sparse-checkout pattern",
+    )?;
+    run_git(
+        ["checkout", reference],
+        Some(repo_dir),
+        "materialize sparse working tree",
+    )
+}
+
+fn full_clone(repo_url: &str, reference: &str, repo_dir: &Path) -> Result<()> {
     let repo_dir_str = repo_dir.to_str().unwrap_or_default();
     let action = format!("clone {repo_url} at ref {reference}");
     run_git(
@@ -468,15 +546,7 @@ fn clone_backing_source(
         ],
         None,
         &action,
-    )?;
-
-    let resolved_sha = capture_git_head_sha(&repo_dir).ok();
-    let skill_dir = repo_dir.join(skill_path);
-    Ok(FetchedBackingSource {
-        path: skill_dir,
-        _temp_dir: temp_dir,
-        resolved_sha,
-    })
+    )
 }
 
 /// Mirror of the CLI's `parse_github_spec`. Duplicated rather than
