@@ -723,6 +723,7 @@ dependencies = [
  "flate2",
  "knack-core",
  "serde",
+ "serde_json",
  "tar",
  "tempfile",
  "tokio",

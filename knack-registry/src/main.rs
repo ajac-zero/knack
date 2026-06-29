@@ -17,8 +17,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use clap::Parser;
 use clap::builder::styling::{AnsiColor, Effects, Styles};
+use clap::{Args, Parser, Subcommand};
 
 /// Colour palette for clap's --help renderer. Matches the knack CLI so
 /// running `--help` on either binary feels like the same toolchain.
@@ -41,6 +41,24 @@ use tokio::sync::RwLock;
 #[command(version, about = "Serve and search a knack registry index")]
 #[command(styles = HELP_STYLES)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    serve: ServeArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Materialise the index once and write a static snapshot suitable for
+    /// hosting on Cloudflare R2, S3, GCS, or any plain static file host.
+    /// The output contains everything a knack CLI client needs to install
+    /// from the registry, with no live server required.
+    BuildStatic(BuildStaticArgs),
+}
+
+#[derive(Debug, Args)]
+struct ServeArgs {
     /// Path to a knack registry index TOML file.
     #[arg(long, default_value = "knack.index.toml")]
     index: PathBuf,
@@ -77,6 +95,31 @@ struct Cli {
     /// this at a mounted volume to keep the cache across container restarts.
     #[arg(long)]
     cache_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct BuildStaticArgs {
+    /// Path to a knack registry index TOML file.
+    #[arg(long, default_value = "knack.index.toml")]
+    index: PathBuf,
+
+    /// Output directory. Existing contents under `skills/` are replaced;
+    /// the directory itself is created if needed. After a successful
+    /// build, this directory contains `info.json`, `index.json`,
+    /// `sha-map.json`, and `skills/<name>.skill.tar.gz` per indexed
+    /// skill. Upload it as-is to your static host.
+    #[arg(long)]
+    output: PathBuf,
+
+    /// Optional registry name written into `info.json` (`{"name": ...}`)
+    /// and used to rewrite `index.json` entries' `source` field as
+    /// `<name>:<skill>` so clients install via `knack add <name>:<skill>`.
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Source alias used to resolve backing sources, e.g. tea=git+ssh://git@gitea.example.com.
+    #[arg(long = "source-alias")]
+    source_aliases: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -281,14 +324,21 @@ struct SearchParams {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let source_aliases = parse_source_aliases(&cli.source_aliases)?;
+    match cli.command {
+        Some(Command::BuildStatic(args)) => build_static(args).await,
+        None => serve(cli.serve).await,
+    }
+}
+
+async fn serve(args: ServeArgs) -> Result<()> {
+    let source_aliases = parse_source_aliases(&args.source_aliases)?;
 
     // Either the operator pointed us at a persistent volume (Fly.io
     // / mounted PV / whatever) or we spin up a tempdir that lives
     // for the process. The latter is the Cloudflare-Containers-style
     // shape: cache benefits within a container's lifetime, rebuilt
     // on every cold start.
-    let (cache_base, cache_tempdir) = match cli.cache_dir.clone() {
+    let (cache_base, cache_tempdir) = match args.cache_dir.clone() {
         Some(path) => (path, None),
         None => {
             let tempdir = tempfile::tempdir().context("failed to create cache tempdir")?;
@@ -297,22 +347,22 @@ async fn main() -> Result<()> {
     };
     let source_cache = Arc::new(SourceCache::new(cache_base, cache_tempdir)?);
 
-    let initial = refresh_index_and_cache(&cli.index, &source_aliases, &source_cache).await?;
+    let initial = refresh_index_and_cache(&args.index, &source_aliases, &source_cache).await?;
     let state = AppState {
         state: Arc::new(RwLock::new(initial)),
-        index_path: cli.index,
-        skills_root: cli.skills_root,
-        name: cli.name,
+        index_path: args.index,
+        skills_root: args.skills_root,
+        name: args.name,
         source_aliases,
     };
 
-    if cli.refresh_interval_seconds > 0 {
+    if args.refresh_interval_seconds > 0 {
         spawn_refresh_task(
             state.state.clone(),
             state.index_path.clone(),
             state.source_aliases.clone(),
             source_cache,
-            Duration::from_secs(cli.refresh_interval_seconds),
+            Duration::from_secs(args.refresh_interval_seconds),
         );
     }
 
@@ -324,15 +374,115 @@ async fn main() -> Result<()> {
         .route("/skills/{name}/archive", get(skill_archive))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(cli.bind)
+    let listener = tokio::net::TcpListener::bind(args.bind)
         .await
-        .with_context(|| format!("failed to bind {}", cli.bind))?;
-    println!("knack-registry listening on http://{}", cli.bind);
+        .with_context(|| format!("failed to bind {}", args.bind))?;
+    println!("knack-registry listening on http://{}", args.bind);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("registry server failed")?;
 
+    Ok(())
+}
+
+/// One-shot materialise: clone all backing sources into a tempdir,
+/// walk for skills, write a static snapshot to `args.output`. The
+/// snapshot is everything a knack CLI client needs (info, index,
+/// per-skill tarballs, SHA map for X-Knack-Resolved-Sha headers) so
+/// it can be uploaded as-is to Cloudflare R2, S3, GCS, or any plain
+/// static host. A tiny Worker (or any equivalent edge function) in
+/// front maps the four CLI-expected endpoints onto these files;
+/// `examples/cloudflare-worker/` is a working starter.
+///
+/// The cache is intentionally a tempdir here: `build-static` runs as
+/// a one-shot CI job, so persistence between runs is pointless — each
+/// run does a fresh sparse clone, materialises, dumps, and exits.
+async fn build_static(args: BuildStaticArgs) -> Result<()> {
+    let source_aliases = parse_source_aliases(&args.source_aliases)?;
+    let cache_tempdir = tempfile::tempdir().context("failed to create cache tempdir")?;
+    let cache = Arc::new(SourceCache::new(
+        cache_tempdir.path().to_path_buf(),
+        Some(cache_tempdir),
+    )?);
+
+    eprintln!("materialising index from {}...", args.index.display());
+    let indexed = refresh_index_and_cache(&args.index, &source_aliases, &cache).await?;
+    eprintln!(
+        "materialised {} skill(s) from {} [[source]] entry(ies)",
+        indexed.locations.len(),
+        indexed.index.source.len(),
+    );
+
+    std::fs::create_dir_all(&args.output)
+        .with_context(|| format!("failed to create output dir {}", args.output.display()))?;
+    let skills_dir = args.output.join("skills");
+    if skills_dir.exists() {
+        // Wipe and recreate so we don't leave stale tarballs behind
+        // for skills that were removed since the last build. Same
+        // self-healing intent as `prune_stale` in the live cache.
+        std::fs::remove_dir_all(&skills_dir).with_context(|| {
+            format!("failed to clear stale skills dir {}", skills_dir.display())
+        })?;
+    }
+    std::fs::create_dir_all(&skills_dir)
+        .with_context(|| format!("failed to create {}", skills_dir.display()))?;
+
+    // info.json — matches the shape served by GET /info on the live
+    // registry. `name` is whatever was passed via --name; null when
+    // omitted. The CLI's `knack registry add <url>` picks the name
+    // up from here.
+    let info = RegistryInfo {
+        name: args.name.clone(),
+        version: env!("CARGO_PKG_VERSION"),
+    };
+    let info_path = args.output.join("info.json");
+    std::fs::write(&info_path, serde_json::to_string_pretty(&info)?)
+        .with_context(|| format!("failed to write {}", info_path.display()))?;
+
+    // index.json — full RegistryIndex, with `source` fields rewritten
+    // to `<name>:<skill>` when --name was set (matches the live
+    // /search endpoint's rewrite behaviour, just done at build time).
+    let mut index = indexed.index.clone();
+    if let Some(name) = &args.name {
+        for skill in &mut index.skill {
+            skill.source = format!("{}:{}", name, skill.name);
+        }
+    }
+    let index_path = args.output.join("index.json");
+    std::fs::write(&index_path, serde_json::to_string_pretty(&index)?)
+        .with_context(|| format!("failed to write {}", index_path.display()))?;
+
+    // sha-map.json — separate file so the Worker can emit
+    // X-Knack-Resolved-Sha headers per-archive without parsing the
+    // whole index. Empty entries are omitted; clients fall back to
+    // checksum-based change detection in that case.
+    let mut sha_map: BTreeMap<String, String> = BTreeMap::new();
+    let mut archive_count = 0usize;
+    for (name, location) in &indexed.locations {
+        if let Some(sha) = location.cached.sha.read().await.clone() {
+            sha_map.insert(name.clone(), sha);
+        }
+        let skill_dir = location.cached.repo_dir.join(&location.relative);
+        let tarball = create_skill_archive_from_dir(&skill_dir)
+            .with_context(|| format!("failed to archive skill {name}"))?;
+        let out_path = skills_dir.join(format!("{name}.skill.tar.gz"));
+        std::fs::write(&out_path, &tarball)
+            .with_context(|| format!("failed to write {}", out_path.display()))?;
+        archive_count += 1;
+    }
+    let sha_map_path = args.output.join("sha-map.json");
+    std::fs::write(&sha_map_path, serde_json::to_string_pretty(&sha_map)?)
+        .with_context(|| format!("failed to write {}", sha_map_path.display()))?;
+
+    eprintln!(
+        "wrote {} (info), {} (index), {} archives, {} (sha-map)",
+        info_path.display(),
+        index_path.display(),
+        archive_count,
+        sha_map_path.display()
+    );
+    eprintln!("static snapshot ready at {}", args.output.display());
     Ok(())
 }
 

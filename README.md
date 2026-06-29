@@ -305,6 +305,21 @@ Dynamic sources must refresh successfully on startup before the registry serves 
 
 Pass `--cache-dir <path>` to keep the cloned backing repos across restarts. When set, refreshes do `git fetch + git reset --hard` against the existing clone instead of re-cloning, and archive requests read straight from the cache directory — no per-request git operations. Point it at a persistent volume (Fly.io Volume, EFS mount, GCP Cloud Run volume, anything that survives container restart) for the full benefit. When omitted, the registry uses a per-process tempdir that's rebuilt on every cold start — that's the right shape for ephemeral-filesystem platforms like Cloudflare Containers.
 
+### Static deployment (Cloudflare R2 + Worker)
+
+For a public, read-mostly registry, the cheapest shape is to skip running a live registry process entirely. Run `knack-registry build-static` from a CI cron job, upload the output to an object store (R2, S3, GCS, anything), and serve it via a small edge worker:
+
+```bash
+knack-registry build-static \
+    --index registries/public.toml \
+    --output ./dist \
+    --name knackpub
+```
+
+This produces `info.json`, `index.json`, `sha-map.json`, and one `skills/<name>.skill.tar.gz` per indexed skill. The output is everything a knack CLI client needs; an edge function in front of the bucket maps the four CLI endpoints (`/info`, `/index`, `/search`, `/skills/<name>/archive`) onto these files. See [`examples/cloudflare-worker/`](examples/cloudflare-worker/) for a working Worker + R2 setup with an hourly GitHub Actions cron, free-tier-friendly at the scale of the public registry (~200 skills, single-digit thousands of requests/day).
+
+Tradeoff: refresh granularity drops from `--refresh-interval-seconds` (default 300s) to whatever your cron interval is (typically 1h). Static loses dynamic queries, auth, and the ability to index private sources — keep `knack-registry serve` for internal team registries where any of those matter.
+
 Static entries are still supported for hand-curated overrides:
 
 ```toml
