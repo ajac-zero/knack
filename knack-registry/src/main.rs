@@ -398,26 +398,53 @@ fn fetch_source_root(
     source: &str,
     source_aliases: &BTreeMap<String, String>,
 ) -> Result<FetchedBackingSource> {
+    // gh: sources resolve directly against github.com without needing
+    // an operator-configured alias. Lets the registry serve any public
+    // GitHub skill repo from its `[[source]]` entries, which is the
+    // common shape for a public-curated index.
+    if let Some(spec) = source.strip_prefix("gh:") {
+        let github = parse_github_spec_for_registry(spec)?;
+        return clone_backing_source(
+            &format!("https://github.com/{}/{}.git", github.owner, github.repo),
+            &github.reference,
+            &github.skill_path,
+        );
+    }
+
     let (alias, rest) = source
         .split_once(':')
         .ok_or_else(|| anyhow::anyhow!("backing source must be alias:owner/repo[@ref]/path"))?;
-    let base_url = source_aliases
-        .get(alias)
-        .with_context(|| format!("source alias not configured on registry: {alias}"))?;
+    let base_url = source_aliases.get(alias).with_context(|| {
+        format!(
+            "source alias not configured on registry: {alias} \
+             (built-in `gh:` is also accepted for github.com)"
+        )
+    })?;
     let git = parse_git_host_source(base_url, rest)?;
+    clone_backing_source(&git.repo_url, &git.reference, &git.skill_path)
+}
 
+/// Shallow-clone `repo_url` at `reference` into a fresh tempdir and
+/// return the resolved skill directory plus the cloned-HEAD SHA.
+/// Shared by both the alias-based and `gh:` paths so SHA capture
+/// stays identical across source schemes.
+fn clone_backing_source(
+    repo_url: &str,
+    reference: &str,
+    skill_path: &Path,
+) -> Result<FetchedBackingSource> {
     let temp_dir = tempfile::tempdir().context("failed to create temporary directory")?;
     let repo_dir = temp_dir.path().join("repo");
     let repo_dir_str = repo_dir.to_str().unwrap_or_default();
-    let action = format!("clone {} at ref {}", git.repo_url, git.reference);
+    let action = format!("clone {repo_url} at ref {reference}");
     run_git(
         [
             "clone",
             "--depth",
             "1",
             "--branch",
-            &git.reference,
-            &git.repo_url,
+            reference,
+            repo_url,
             repo_dir_str,
         ],
         None,
@@ -425,12 +452,56 @@ fn fetch_source_root(
     )?;
 
     let resolved_sha = capture_git_head_sha(&repo_dir).ok();
-    let skill_dir = repo_dir.join(git.skill_path);
+    let skill_dir = repo_dir.join(skill_path);
     Ok(FetchedBackingSource {
         path: skill_dir,
         _temp_dir: temp_dir,
         resolved_sha,
     })
+}
+
+/// Mirror of the CLI's `parse_github_spec`. Duplicated rather than
+/// moved to knack-core so this commit is scoped to just the registry —
+/// once we hit a third call site we should hoist the spec types into
+/// knack-core (alongside SkillFrontmatter and Lockfile).
+/// Parses a `gh:` source like the CLI's parser, but with one
+/// difference: an empty skill path is allowed. `[[source]]` entries
+/// in `knack.index.toml` point at a whole repo to be walked by
+/// `materialize_dynamic_sources`; `[[skill]]` entries point at a
+/// specific path inside a repo. We accept both shapes; the caller
+/// (materialize vs. archive serving) interprets the resulting path
+/// accordingly.
+fn parse_github_spec_for_registry(spec: &str) -> Result<GithubSpecLite> {
+    let mut parts = spec.splitn(3, '/');
+    let owner = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("gh: source must be gh:owner/repo[@ref][/path/to/skill]"))?;
+    let repo_with_ref = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("gh: source must include a repository"))?;
+    let skill_path = parts.next().unwrap_or("");
+    let (repo, reference) = repo_with_ref
+        .split_once('@')
+        .unwrap_or((repo_with_ref, "main"));
+    if repo.is_empty() || reference.is_empty() {
+        bail!("gh: source repository and ref must not be empty");
+    }
+    Ok(GithubSpecLite {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        reference: reference.to_string(),
+        skill_path: PathBuf::from(skill_path),
+    })
+}
+
+#[derive(Debug)]
+struct GithubSpecLite {
+    owner: String,
+    repo: String,
+    reference: String,
+    skill_path: PathBuf,
 }
 
 /// Run `git rev-parse HEAD` in `repo_dir` and return the full 40-char
