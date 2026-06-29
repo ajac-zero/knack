@@ -100,9 +100,12 @@ pub fn validate_skill(skill: &Skill) -> Result<()> {
         bail!("description must not be empty");
     }
 
-    if skill.description.chars().count() > 1024 {
-        bail!("description must be at most 1024 characters");
-    }
+    // We previously rejected descriptions over 1024 characters, but
+    // real-world Agent Skills (notably anthropics/skills) include
+    // multi-paragraph "use when..." prose well past that ceiling
+    // (skill-creator runs to ~5200 chars). knack should not gatekeep
+    // the format the broader ecosystem uses; UIs are free to truncate
+    // long descriptions at display time. Required fields stay strict.
 
     Ok(())
 }
@@ -406,6 +409,29 @@ mod tests {
         // Removing deny_unknown_fields shouldn't make typos in REQUIRED
         // fields silent. Missing `description` should still fail.
         assert!(parse_frontmatter("---\nname: x\ndesciption: oops\n---\n").is_err());
+    }
+
+    #[test]
+    fn accepts_long_descriptions() {
+        // Real ecosystem SKILL.md files (anthropics/skills/skill-creator
+        // is ~5200 chars) bury invocation guidance in description. The
+        // old 1024-char ceiling locked us out of indexing them. Empty
+        // descriptions still fail; length no longer does.
+        let long = "Use when the user is doing things. ".repeat(200);
+        assert!(long.len() > 1024);
+        let skill = Skill {
+            path: PathBuf::from("/tmp/example"),
+            name: "example".to_string(),
+            description: long,
+        };
+        assert!(validate_skill(&skill).is_ok());
+
+        let blank = Skill {
+            path: PathBuf::from("/tmp/example"),
+            name: "example".to_string(),
+            description: "   ".to_string(),
+        };
+        assert!(validate_skill(&blank).is_err());
     }
 
     #[test]
