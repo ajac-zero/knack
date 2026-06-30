@@ -230,10 +230,24 @@ pub struct InstallConfig {
 /// An old knack reading a new lockfile errors loudly rather than
 /// guessing — that's what `Lockfile::ensure_supported_version`
 /// enforces.
-pub const LOCKFILE_VERSION: u32 = 1;
+///
+/// Version history
+/// - **v1**: initial layout. `name`, `source`, `resolved`, `checksum`.
+///   Lockfiles with no `version` field at all are also v1 (the field
+///   only became required when v2 landed).
+/// - **v2**: adds optional `namespace` per locked skill so namespaced
+///   registries (`public:anthropics/pdf`) can round-trip through the
+///   lockfile without losing the vendor scope. Old v1 entries with no
+///   `namespace` field continue to read fine into v2; new writes emit
+///   `version = 2` and include the field when scoped.
+pub const LOCKFILE_VERSION: u32 = 2;
 
 fn default_lockfile_version() -> u32 {
-    LOCKFILE_VERSION
+    // Missing-version means "written before this field existed" → v1
+    // by definition, not the current latest. Without this we'd
+    // silently promote untouched v1 files to whatever LOCKFILE_VERSION
+    // happens to be today, masking actual version skew.
+    1
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -276,6 +290,15 @@ impl Lockfile {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LockedSkill {
     pub name: String,
+
+    /// Vendor scope for namespaced registries (lockfile v2+). None
+    /// for legacy unscoped entries written by knack 0.2.x or skills
+    /// installed from unnamespaced sources (gh:/git+/local paths).
+    /// `skip_serializing_if = "Option::is_none"` keeps legacy entries
+    /// from gaining a noisy `namespace = ""` on round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+
     pub source: String,
     pub resolved: String,
     pub checksum: String,
@@ -306,8 +329,26 @@ pub struct RegistryIndex {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IndexedSkill {
     pub name: String,
+
+    /// Vendor-scoping prefix added at materialize time so two skills
+    /// sharing a bare name (e.g. `find-skills` exists in both
+    /// vercel-labs/skills and ajac-zero/knack) can coexist in one
+    /// registry without colliding. None means "unscoped" — supported
+    /// for backward compatibility with pre-namespacing index files;
+    /// new entries written by `knack-registry build-static` or
+    /// `materialize` always carry one. Validated against the same
+    /// kebab-case rules as `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+
     pub description: String,
+
+    /// The install command suffix that follows `<registry>:`. For
+    /// namespaced entries this is `<namespace>/<name>`; for legacy
+    /// unscoped entries it's just `<name>`. Always matches what
+    /// `qualified_name()` returns.
     pub source: String,
+
     #[serde(default)]
     pub tags: Vec<String>,
 }
@@ -361,6 +402,12 @@ impl IndexSource {
 impl IndexedSkill {
     pub fn validate(&self) -> Result<()> {
         validate_skill_name(&self.name)?;
+        if let Some(ns) = &self.namespace {
+            // Namespaces use the same character set as skill names —
+            // kebab-case for URL-safe round-tripping through
+            // `/skills/<ns>/<name>/archive`.
+            validate_skill_name(ns).map_err(|err| anyhow!("invalid namespace: {err}"))?;
+        }
         if self.description.trim().is_empty() {
             bail!("indexed skill description must not be empty: {}", self.name);
         }
@@ -370,8 +417,27 @@ impl IndexedSkill {
         Ok(())
     }
 
+    /// `<namespace>/<name>` when scoped, bare `<name>` otherwise. This
+    /// is the on-the-wire identifier — what comes after `<registry>:`
+    /// in install commands, and what's used as the archive URL path
+    /// segment.
+    pub fn qualified_name(&self) -> String {
+        match &self.namespace {
+            Some(ns) => format!("{ns}/{}", self.name),
+            None => self.name.clone(),
+        }
+    }
+
     fn search_text(&self) -> String {
-        format!("{} {} {}", self.name, self.description, self.tags.join(" ")).to_ascii_lowercase()
+        let ns = self.namespace.as_deref().unwrap_or("");
+        format!(
+            "{} {} {} {}",
+            ns,
+            self.name,
+            self.description,
+            self.tags.join(" ")
+        )
+        .to_ascii_lowercase()
     }
 }
 
@@ -479,14 +545,16 @@ mod tests {
             skill: vec![
                 IndexedSkill {
                     name: "pdf".to_string(),
+                    namespace: Some("anthropics".to_string()),
                     description: "Work with PDF documents".to_string(),
-                    source: "gh:anthropics/skills/skills/pdf".to_string(),
+                    source: "anthropics/pdf".to_string(),
                     tags: vec!["documents".to_string(), "ocr".to_string()],
                 },
                 IndexedSkill {
                     name: "rust-code-review".to_string(),
+                    namespace: None,
                     description: "Review Rust code".to_string(),
-                    source: "tea:platform/skills/rust-code-review".to_string(),
+                    source: "rust-code-review".to_string(),
                     tags: vec!["rust".to_string()],
                 },
             ],
@@ -496,5 +564,153 @@ mod tests {
         assert_eq!(index.search("pdf").len(), 1);
         assert_eq!(index.search("documents ocr").len(), 1);
         assert_eq!(index.search("python").len(), 0);
+        // Namespace itself is searchable so users can scope by vendor:
+        // `knack find anthropics` lists everything from that vendor.
+        assert_eq!(index.search("anthropics").len(), 1);
+    }
+
+    #[test]
+    fn qualified_name_round_trips() {
+        let scoped = IndexedSkill {
+            name: "pdf".to_string(),
+            namespace: Some("anthropics".to_string()),
+            description: "x".to_string(),
+            source: "anthropics/pdf".to_string(),
+            tags: vec![],
+        };
+        assert_eq!(scoped.qualified_name(), "anthropics/pdf");
+
+        let unscoped = IndexedSkill {
+            name: "legacy".to_string(),
+            namespace: None,
+            description: "x".to_string(),
+            source: "legacy".to_string(),
+            tags: vec![],
+        };
+        assert_eq!(unscoped.qualified_name(), "legacy");
+    }
+
+    #[test]
+    fn validates_namespace_charset() {
+        // Same kebab-case rules as skill name (URL-safe).
+        let mut skill = IndexedSkill {
+            name: "ok".to_string(),
+            namespace: Some("good-ns".to_string()),
+            description: "x".to_string(),
+            source: "good-ns/ok".to_string(),
+            tags: vec![],
+        };
+        assert!(skill.validate().is_ok());
+
+        skill.namespace = Some("Bad_Namespace".to_string());
+        let err = skill.validate().unwrap_err().to_string();
+        assert!(err.contains("invalid namespace"), "got: {err}");
+    }
+
+    #[test]
+    fn parses_v1_lockfile_without_version_or_namespace() {
+        // Lockfiles written by knack 0.1.x had no `version` field and
+        // no `namespace`. Reading one with v2-aware knack must yield
+        // version=1, namespace=None — never silently promote to v2.
+        let toml_v1 = r#"
+[[skill]]
+name = "pdf"
+source = "public:pdf"
+resolved = "http+knack:https://example.com/skills/pdf/archive#sha=abc123"
+checksum = "sha256:deadbeef"
+"#;
+        let lockfile: Lockfile = toml::from_str(toml_v1).expect("v1 lockfile must parse");
+        assert_eq!(lockfile.version, 1);
+        assert_eq!(lockfile.skill.len(), 1);
+        assert_eq!(lockfile.skill[0].namespace, None);
+        assert!(lockfile.ensure_supported_version().is_ok());
+    }
+
+    #[test]
+    fn parses_v2_lockfile_with_namespace() {
+        let toml_v2 = r#"
+version = 2
+
+[[skill]]
+name = "pdf"
+namespace = "anthropics"
+source = "public:anthropics/pdf"
+resolved = "http+knack:https://example.com/skills/anthropics/pdf/archive#sha=abc"
+checksum = "sha256:deadbeef"
+"#;
+        let lockfile: Lockfile = toml::from_str(toml_v2).expect("v2 lockfile must parse");
+        assert_eq!(lockfile.version, 2);
+        assert_eq!(lockfile.skill[0].namespace.as_deref(), Some("anthropics"));
+    }
+
+    #[test]
+    fn rejects_lockfile_from_newer_knack() {
+        let future = r#"
+version = 999
+[[skill]]
+name = "pdf"
+source = "public:pdf"
+resolved = "x"
+checksum = "x"
+"#;
+        let lockfile: Lockfile = toml::from_str(future).unwrap();
+        let err = lockfile
+            .ensure_supported_version()
+            .expect_err("future lockfile must be rejected");
+        assert!(err.contains("newer than this knack supports"), "got: {err}");
+    }
+
+    #[test]
+    fn locked_skill_omits_namespace_when_absent() {
+        let skill = LockedSkill {
+            name: "pdf".to_string(),
+            namespace: None,
+            source: "public:pdf".to_string(),
+            resolved: "x".to_string(),
+            checksum: "y".to_string(),
+        };
+        let serialized = toml::to_string(&skill).unwrap();
+        assert!(
+            !serialized.contains("namespace"),
+            "namespace should be omitted from legacy entries, got: {serialized}"
+        );
+    }
+
+    #[test]
+    fn parses_legacy_unnamespaced_index_json() {
+        // index.json files produced by knack-registry 0.2.x don't
+        // carry a `namespace` field. They MUST keep deserializing —
+        // existing R2 buckets, lockfiles, and clients depend on that.
+        let json = r#"{
+            "name": "pdf",
+            "description": "PDF docs",
+            "source": "public:pdf",
+            "tags": ["documents"]
+        }"#;
+        let parsed: IndexedSkill =
+            serde_json::from_str(json).expect("legacy index.json must parse");
+        assert_eq!(parsed.name, "pdf");
+        assert_eq!(parsed.namespace, None);
+        assert_eq!(parsed.qualified_name(), "pdf");
+    }
+
+    #[test]
+    fn omits_namespace_field_when_absent_on_serialize() {
+        // Symmetric to the legacy-parse test: writing out an unscoped
+        // skill should not introduce a noisy `"namespace": null` into
+        // index.json. skip_serializing_if = "Option::is_none" enforces
+        // this round-trip cleanliness.
+        let skill = IndexedSkill {
+            name: "legacy".to_string(),
+            namespace: None,
+            description: "x".to_string(),
+            source: "legacy".to_string(),
+            tags: vec![],
+        };
+        let json = serde_json::to_string(&skill).unwrap();
+        assert!(
+            !json.contains("namespace"),
+            "namespace should be omitted, got: {json}"
+        );
     }
 }

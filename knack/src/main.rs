@@ -679,6 +679,12 @@ fn generate_index(root: &Path, source_prefix: &str, output: &Path) -> Result<()>
         let relative = relative.to_string_lossy().replace('\\', "/");
         index.skill.push(IndexedSkill {
             name: skill.name,
+            // Static-index generation doesn't know a namespace —
+            // operators authoring a knack.index.toml can add scoping
+            // by hand if they need it. Dynamic-source materialize
+            // (the registry side) does derive namespaces; that lands
+            // in a subsequent commit.
+            namespace: None,
             description: skill.description,
             source: format!("{}/{}", source_prefix.trim_end_matches('/'), relative),
             tags: Vec::new(),
@@ -1189,6 +1195,10 @@ fn add_skill(manifest_path: &Path, source: &str, default_target: &Path) -> Resul
         &mut lockfile,
         LockedSkill {
             name: installed.name.clone(),
+            // Namespace plumbing through install lands in the
+            // install-command parser commit; leave None until that
+            // commit threads the parsed namespace through here.
+            namespace: None,
             source: source.to_string(),
             resolved: locked_resolved,
             checksum: checksum_dir(&installed.path)?,
@@ -1323,6 +1333,10 @@ fn sync_skills(manifest_path: &Path) -> Result<()> {
             &mut lockfile,
             LockedSkill {
                 name: installed.name.clone(),
+                // Namespace lands in the next commit (install-command
+                // parser); leave None for the pure data-model
+                // addition of this commit.
+                namespace: None,
                 source: source.clone(),
                 resolved: locked_resolved,
                 checksum: checksum_dir(&installed.path)?,
@@ -1435,6 +1449,9 @@ fn update_skills(
             &mut lockfile,
             LockedSkill {
                 name: installed.name.clone(),
+                // See sibling comment: namespace threading lands in
+                // the install-command parser commit.
+                namespace: None,
                 source: source.clone(),
                 resolved: locked_resolved,
                 checksum: new_checksum.clone(),

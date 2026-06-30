@@ -614,6 +614,10 @@ async fn refresh_index_and_cache(
             );
             index.skill.push(IndexedSkill {
                 name: skill.name,
+                // Namespace plumbing is added in the materialize commit
+                // (subsequent commit in this chain); leave None for now
+                // so this commit stays a pure data-model addition.
+                namespace: None,
                 description: skill.description,
                 source: skill_source,
                 tags: source.tags.clone(),
