@@ -1,9 +1,11 @@
 # Static knack-registry deployment on Cloudflare
 
 This example hosts a knack registry as static files in Cloudflare R2,
-served by a small Cloudflare Worker. The Worker implements the four
-endpoints the knack CLI talks to (`/info`, `/index`, `/search`,
-`/skills/<name>/archive`) on top of pre-built artifacts produced by
+served by a small Cloudflare Worker. The Worker implements the
+endpoints the knack CLI talks to — `/info`, `/index`, `/search`,
+`/skills/<namespace>/<name>/archive` (namespaced canonical form), and
+`/skills/<name>/archive` (legacy soft-resolved form for pre-namespacing
+clients) — on top of pre-built artifacts produced by
 `knack-registry build-static`.
 
 At the scale of a curated public registry (~200 skills, single-digit
@@ -93,8 +95,11 @@ cd dist
 for file in info.json index.json sha-map.json; do
     wrangler r2 object put knack-registry-public/$file --file=$file
 done
-for tarball in skills/*.skill.tar.gz; do
-    wrangler r2 object put knack-registry-public/$tarball --file=$tarball
+# `find` rather than `skills/*` so we recurse into namespace directories
+# (skills/<namespace>/<name>.skill.tar.gz) added when build-static
+# materialised scoped skills.
+find skills -type f -name '*.skill.tar.gz' | while read tarball; do
+    wrangler r2 object put "knack-registry-public/$tarball" --file="$tarball"
 done
 ```
 
@@ -142,8 +147,10 @@ jobs:
           for file in info.json index.json sha-map.json; do
               wrangler r2 object put knack-registry-public/$file --file=$file
           done
-          for tarball in skills/*.skill.tar.gz; do
-              wrangler r2 object put knack-registry-public/$tarball --file=$tarball
+          # `find` rather than `skills/*` so nested namespace dirs
+          # (skills/<namespace>/<name>.skill.tar.gz) are picked up.
+          find skills -type f -name '*.skill.tar.gz' | while read tarball; do
+              wrangler r2 object put "knack-registry-public/$tarball" --file="$tarball"
           done
 ```
 
@@ -158,13 +165,25 @@ that with your own domain when verifying a fork. Registry name is
 curl https://knack.ajac-zero.com/info
 curl https://knack.ajac-zero.com/index | jq '.skill | length'
 curl 'https://knack.ajac-zero.com/search?q=pdf' | jq
-curl -D - https://knack.ajac-zero.com/skills/pdf/archive -o /tmp/pdf.tgz | grep -i x-knack
+
+# Namespaced (canonical) — direct R2 lookup.
+curl -D - https://knack.ajac-zero.com/skills/anthropics/pdf/archive \
+    -o /tmp/pdf.tgz | grep -i x-knack
+# Expect both X-Knack-Resolved-Sha AND X-Knack-Namespace: anthropics.
+
+# Legacy bare — soft-resolves via index.json. Same response when the
+# bare name is unique across all namespaces; 409 with disambiguation
+# when ambiguous.
+curl -D - https://knack.ajac-zero.com/skills/pdf/archive \
+    -o /tmp/pdf.tgz | grep -i x-knack
+
 tar -tzf /tmp/pdf.tgz | head
 
 # Or use the actual CLI.
 knack registry add https://knack.ajac-zero.com
 knack find pdf
-knack add public:pdf
+knack add public:anthropics/pdf      # canonical
+knack add public:pdf                 # legacy bare, registry resolves
 ```
 
 ## What this Worker does NOT do
