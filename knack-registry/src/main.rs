@@ -31,7 +31,10 @@ const HELP_STYLES: Styles = Styles::styled()
     .valid(AnsiColor::Green.on_default())
     .invalid(AnsiColor::Yellow.on_default());
 use flate2::{Compression, write::GzEncoder};
-use knack_core::{IndexedSkill, RegistryIndex, collect_files, read_skill, validate_skill_metadata};
+use knack_core::{
+    IndexedSkill, RegistryIndex, collect_files, read_skill, validate_skill_metadata,
+    validate_skill_name,
+};
 use serde::Deserialize;
 use tar::{Builder, Header};
 use tokio::sync::RwLock;
@@ -371,7 +374,19 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route("/info", get(info))
         .route("/index", get(get_index))
         .route("/search", get(search))
-        .route("/skills/{name}/archive", get(skill_archive))
+        // Namespaced route — canonical for namespacing-aware clients
+        // ("knack add public:anthropics/pdf"). Direct (namespace, name)
+        // lookup, no ambiguity.
+        .route(
+            "/skills/{namespace}/{name}/archive",
+            get(skill_archive_namespaced),
+        )
+        // Legacy single-segment route — kept for backward compat with
+        // pre-namespacing clients (`knack add public:pdf`). Soft-
+        // resolves: 200 with X-Knack-Namespace when exactly one
+        // namespaced entry matches the bare name, 409 with a
+        // disambiguation hint when several do, 404 otherwise.
+        .route("/skills/{name}/archive", get(skill_archive_legacy))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(args.bind)
@@ -441,12 +456,15 @@ async fn build_static(args: BuildStaticArgs) -> Result<()> {
         .with_context(|| format!("failed to write {}", info_path.display()))?;
 
     // index.json — full RegistryIndex, with `source` fields rewritten
-    // to `<name>:<skill>` when --name was set (matches the live
+    // to `<name>:<qualified>` when --name was set (matches the live
     // /search endpoint's rewrite behaviour, just done at build time).
+    // qualified_name() handles both scoped and unscoped entries so
+    // legacy unscoped skills serialise as "<name>:<skill>" without a
+    // stray "/" while scoped ones get the canonical install command.
     let mut index = indexed.index.clone();
     if let Some(name) = &args.name {
         for skill in &mut index.skill {
-            skill.source = format!("{}:{}", name, skill.name);
+            skill.source = format!("{}:{}", name, skill.qualified_name());
         }
     }
     let index_path = args.output.join("index.json");
@@ -455,18 +473,32 @@ async fn build_static(args: BuildStaticArgs) -> Result<()> {
 
     // sha-map.json — separate file so the Worker can emit
     // X-Knack-Resolved-Sha headers per-archive without parsing the
-    // whole index. Empty entries are omitted; clients fall back to
-    // checksum-based change detection in that case.
+    // whole index. Keyed by the same qualified form the Worker uses
+    // to map URL → R2 key, so a request for
+    // /skills/<ns>/<name>/archive can resolve "<ns>/<name>" against
+    // the map with a single string operation. Empty entries are
+    // omitted; clients fall back to checksum-based change detection
+    // in that case.
+    //
+    // Tarball layout: skills/<namespace>/<name>.skill.tar.gz when
+    // scoped, skills/<name>.skill.tar.gz when not. The intermediate
+    // namespace directory is created on demand so the Worker's R2
+    // PUT (`wrangler r2 object put`) can use `find skills -type f`
+    // to walk the tree without special-casing.
     let mut sha_map: BTreeMap<String, String> = BTreeMap::new();
     let mut archive_count = 0usize;
-    for (name, location) in &indexed.locations {
+    for (qualified, location) in &indexed.locations {
         if let Some(sha) = location.cached.sha.read().await.clone() {
-            sha_map.insert(name.clone(), sha);
+            sha_map.insert(qualified.clone(), sha);
         }
         let skill_dir = location.cached.repo_dir.join(&location.relative);
         let tarball = create_skill_archive_from_dir(&skill_dir)
-            .with_context(|| format!("failed to archive skill {name}"))?;
-        let out_path = skills_dir.join(format!("{name}.skill.tar.gz"));
+            .with_context(|| format!("failed to archive skill {qualified}"))?;
+        let out_path = skills_dir.join(format!("{qualified}.skill.tar.gz"));
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create namespace dir {}", parent.display()))?;
+        }
         std::fs::write(&out_path, &tarball)
             .with_context(|| format!("failed to write {}", out_path.display()))?;
         archive_count += 1;
@@ -486,6 +518,18 @@ async fn build_static(args: BuildStaticArgs) -> Result<()> {
     Ok(())
 }
 
+/// Compose the lookup key used in the locations map and as the URL
+/// path segment under /skills/. Same shape that
+/// IndexedSkill::qualified_name() produces but available without a
+/// full IndexedSkill in hand — used during materialize before the
+/// IndexedSkill is constructed.
+fn qualified_key(namespace: &Option<String>, name: &str) -> String {
+    match namespace {
+        Some(ns) => format!("{ns}/{name}"),
+        None => name.to_string(),
+    }
+}
+
 fn read_index(path: &Path) -> Result<RegistryIndex> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -501,34 +545,54 @@ async fn refresh_index_and_cache(
     cache: &SourceCache,
 ) -> Result<IndexedState> {
     let mut index = read_index(path)?;
+    // Keyed by qualified_name (`<namespace>/<name>` when scoped, bare
+    // `<name>` otherwise) so two skills sharing a bare name across
+    // namespaces coexist instead of clobbering each other. See
+    // log_namespace_collision below for the rejection path on actual
+    // same-namespace duplicates.
     let mut locations: HashMap<String, SkillLocation> = HashMap::new();
     let mut active_sources: BTreeSet<String> = BTreeSet::new();
 
-    // Static [[skill]] entries first so they win name collisions
-    // against dynamic walks — an operator that pinned a specific
-    // skill by hand presumably did so deliberately.
-    for skill in index.skill.clone() {
-        active_sources.insert(skill.source.clone());
-        let cached = cache.slot(&skill.source);
-        if let Err(err) = refresh_cached_source(&cached, &skill.source, source_aliases).await {
+    // Static [[skill]] entries first so they win when an operator
+    // hand-pinned a skill and a dynamic walk would otherwise produce
+    // the same (namespace, name) tuple. The operator's explicit
+    // intent wins; the dynamic copy gets a warn-and-skip.
+    for i in 0..index.skill.len() {
+        let static_skill = index.skill[i].clone();
+        active_sources.insert(static_skill.source.clone());
+        // Static entries may set `namespace = "..."` directly. When
+        // unset, we infer from the source URL the same way we do for
+        // dynamic sources — consistent behaviour across both shapes.
+        let resolved_namespace = static_skill
+            .namespace
+            .clone()
+            .or_else(|| infer_namespace_from_source(&static_skill.source));
+        let qualified = qualified_key(&resolved_namespace, &static_skill.name);
+
+        let cached = cache.slot(&static_skill.source);
+        if let Err(err) = refresh_cached_source(&cached, &static_skill.source, source_aliases).await
+        {
             eprintln!(
                 "failed to refresh static entry {} from {}: {err:#}",
-                skill.name, skill.source
+                qualified, static_skill.source
             );
             continue;
         }
-        let relative = source_subpath(&skill.source, source_aliases).unwrap_or_default();
+        let relative = source_subpath(&static_skill.source, source_aliases).unwrap_or_default();
         let skill_md = cached.repo_dir.join(&relative).join("SKILL.md");
         if !skill_md.is_file() {
             eprintln!(
                 "static skill {} has no SKILL.md at {}",
-                skill.name,
+                qualified,
                 skill_md.display()
             );
             continue;
         }
+        // Write the resolved namespace back into the IndexedSkill so
+        // it surfaces in /index, /search, and downstream rewrites.
+        index.skill[i].namespace = resolved_namespace;
         locations.insert(
-            skill.name.clone(),
+            qualified,
             SkillLocation {
                 cached: cached.clone(),
                 relative,
@@ -536,8 +600,6 @@ async fn refresh_index_and_cache(
         );
     }
 
-    let static_skill_names: BTreeSet<String> =
-        index.skill.iter().map(|skill| skill.name.clone()).collect();
     let dynamic_sources = index.source.clone();
     for source in dynamic_sources {
         active_sources.insert(source.source.clone());
@@ -549,6 +611,17 @@ async fn refresh_index_and_cache(
             );
             continue;
         }
+        // Effective namespace for every skill materialised under this
+        // source: explicit override on the [[source]] entry, falling
+        // back to inference from the source URL. Per-skill overrides
+        // (e.g. a single SKILL.md inside a multi-vendor repo wanting
+        // a different scope) aren't supported on dynamic walks — the
+        // operator can move that skill to a static [[skill]] entry
+        // with its own `namespace` field if they need that granularity.
+        let effective_namespace = source
+            .namespace
+            .clone()
+            .or_else(|| infer_namespace_from_source(&source.source));
         let subpath = source_subpath(&source.source, source_aliases).unwrap_or_default();
         let walk_root = cached.repo_dir.join(&subpath);
 
@@ -581,10 +654,17 @@ async fn refresh_index_and_cache(
                 eprintln!("skipping {}: {err:#}", skill_dir.display());
                 continue;
             }
-            if static_skill_names.contains(&skill.name)
-                || locations.contains_key(&skill.name)
-                || index.skill.iter().any(|indexed| indexed.name == skill.name)
-            {
+            let qualified = qualified_key(&effective_namespace, &skill.name);
+            if locations.contains_key(&qualified) {
+                // First-wins: the earlier source (static or a prior
+                // dynamic entry in the TOML order) holds the slot.
+                // Operators control conflict resolution by reordering
+                // [[source]] entries — deterministic and debuggable.
+                eprintln!(
+                    "warn: skipped duplicate skill `{qualified}` from {} \
+                     (already provided by an earlier source)",
+                    source.source
+                );
                 continue;
             }
             let relative_to_walk = skill_dir.strip_prefix(&walk_root).with_context(|| {
@@ -606,7 +686,7 @@ async fn refresh_index_and_cache(
             };
             let relative_to_repo = subpath.join(relative_to_walk);
             locations.insert(
-                skill.name.clone(),
+                qualified,
                 SkillLocation {
                     cached: cached.clone(),
                     relative: relative_to_repo,
@@ -614,19 +694,14 @@ async fn refresh_index_and_cache(
             );
             index.skill.push(IndexedSkill {
                 name: skill.name,
-                // Namespace plumbing is added in the materialize commit
-                // (subsequent commit in this chain); leave None for now
-                // so this commit stays a pure data-model addition.
-                namespace: None,
+                namespace: effective_namespace.clone(),
                 description: skill.description,
                 source: skill_source,
                 tags: source.tags.clone(),
             });
         }
     }
-    index
-        .skill
-        .sort_by(|left, right| left.name.cmp(&right.name));
+    index.skill.sort_by_key(|skill| skill.qualified_name());
     index.validate()?;
 
     // Drop cache entries (and their on-disk dirs) for sources the
@@ -719,18 +794,98 @@ async fn search(
         guard.index.search(&params.q).into_iter().cloned().collect();
     drop(guard);
     if let Some(name) = &state.name {
+        // Rewrite to the install-command form the user can paste:
+        //   public:anthropics/pdf   ← when scoped
+        //   public:pdf              ← legacy unscoped
+        // qualified_name() handles both cases so we don't branch
+        // here on Option<namespace>.
         for skill in &mut results {
-            skill.source = format!("{}:{}", name, skill.name);
+            skill.source = format!("{}:{}", name, skill.qualified_name());
         }
     }
     Json(results)
 }
 
-async fn skill_archive(
+/// Namespaced archive route: `/skills/<namespace>/<name>/archive`.
+/// Direct lookup against the qualified key, no ambiguity. 404 if
+/// no such (namespace, name) exists.
+async fn skill_archive_namespaced(
+    State(state): State<AppState>,
+    AxumPath((namespace, name)): AxumPath<(String, String)>,
+) -> Response {
+    // Defend against URL-encoded slashes or other shenanigans that
+    // would let a caller smuggle a path segment into either field.
+    if validate_skill_name(&namespace).is_err() || validate_skill_name(&name).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "namespace and name must be kebab-case identifiers",
+        )
+            .into_response();
+    }
+    let qualified = format!("{namespace}/{name}");
+    archive_response(&state, &qualified, Some(&namespace), &name).await
+}
+
+/// Legacy archive route: `/skills/<name>/archive`. Soft-resolves a
+/// bare name against the index: 200 + X-Knack-Namespace when
+/// exactly one namespaced (or unscoped) entry matches, 409 when
+/// several do (with a hint listing the alternatives), 404
+/// otherwise. Lets pre-namespacing knack CLIs and pre-migration
+/// manifests/lockfiles keep working after the registry upgrade.
+async fn skill_archive_legacy(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Response {
-    match create_skill_archive(&state, &name).await {
+    if validate_skill_name(&name).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "skill name must be a kebab-case identifier",
+        )
+            .into_response();
+    }
+    // Scan the index for any entry whose bare name matches.
+    let matches: Vec<(Option<String>, String)> = {
+        let guard = state.state.read().await;
+        guard
+            .index
+            .skill
+            .iter()
+            .filter(|skill| skill.name == name)
+            .map(|skill| (skill.namespace.clone(), skill.qualified_name()))
+            .collect()
+    };
+    match matches.len() {
+        0 => (StatusCode::NOT_FOUND, format!("skill not found: {name}")).into_response(),
+        1 => {
+            let (namespace, qualified) = matches.into_iter().next().expect("len checked");
+            archive_response(&state, &qualified, namespace.as_deref(), &name).await
+        }
+        _ => {
+            // Disambiguation hint lists each available qualified
+            // identifier so the user can copy-paste the one they
+            // want into a namespaced install command.
+            let qualifieds: Vec<String> = matches.into_iter().map(|(_, q)| q).collect();
+            let hint = format!(
+                "skill `{name}` is ambiguous across namespaces: [{}]; \
+                 retry as one of the namespaced forms above",
+                qualifieds.join(", ")
+            );
+            (StatusCode::CONFLICT, hint).into_response()
+        }
+    }
+}
+
+/// Shared response builder for both namespaced and legacy archive
+/// routes. Looks up the qualified key in the locations map, streams
+/// the tarball, and sets the response headers (Content-Type,
+/// Content-Disposition, X-Knack-Resolved-Sha, X-Knack-Namespace).
+async fn archive_response(
+    state: &AppState,
+    qualified: &str,
+    namespace: Option<&str>,
+    name: &str,
+) -> Response {
+    match create_skill_archive(state, qualified, name).await {
         Ok(archive) => {
             let disposition = format!("attachment; filename=\"{name}.skill.tar.gz\"");
             let mut headers = axum::http::HeaderMap::new();
@@ -742,13 +897,22 @@ async fn skill_archive(
                 headers.insert(header::CONTENT_DISPOSITION, value);
             }
             if let Some(sha) = archive.resolved_sha {
-                // Clients (knack CLI) use this to pin their lockfile's
-                // `resolved` field. Header is omitted when the backing
-                // source has no SHA (local skills_root, archives we
-                // couldn't rev-parse).
                 if let Ok(value) = axum::http::HeaderValue::from_str(&sha) {
                     headers.insert(
                         axum::http::HeaderName::from_static("x-knack-resolved-sha"),
+                        value,
+                    );
+                }
+            }
+            // X-Knack-Namespace lets a CLI that hit the legacy
+            // single-segment URL learn which namespace served it so
+            // it can persist that into the lockfile and use the
+            // namespaced URL on subsequent syncs. Omitted when the
+            // resolved skill has no namespace.
+            if let Some(ns) = namespace {
+                if let Ok(value) = axum::http::HeaderValue::from_str(ns) {
+                    headers.insert(
+                        axum::http::HeaderName::from_static("x-knack-namespace"),
                         value,
                     );
                 }
@@ -764,13 +928,18 @@ struct SkillArchive {
     resolved_sha: Option<String>,
 }
 
-async fn create_skill_archive(state: &AppState, name: &str) -> Result<SkillArchive> {
+async fn create_skill_archive(
+    state: &AppState,
+    qualified: &str,
+    bare_name: &str,
+) -> Result<SkillArchive> {
     if let Some(skills_root) = &state.skills_root {
-        let skill_dir = skills_root.join(name);
+        // Local --skills-root layouts don't carry namespacing on disk
+        // — they predate the concept and are typically a single-vendor
+        // operator dropping SKILL.md trees alongside the binary. Look
+        // up by bare name so that flow keeps working.
+        let skill_dir = skills_root.join(bare_name);
         if skill_dir.join("SKILL.md").is_file() {
-            // Local skills_root has no upstream git history to capture,
-            // so no SHA. Clients fall back to checksum-based change
-            // detection for these.
             return Ok(SkillArchive {
                 bytes: create_skill_archive_from_dir(&skill_dir)?,
                 resolved_sha: None,
@@ -782,9 +951,9 @@ async fn create_skill_archive(state: &AppState, name: &str) -> Result<SkillArchi
         let guard = state.state.read().await;
         guard
             .locations
-            .get(name)
+            .get(qualified)
             .cloned()
-            .with_context(|| format!("skill not found: {name}"))?
+            .with_context(|| format!("skill not found: {qualified}"))?
     };
 
     // Hold the cached source's refresh-read lock while we tar the
@@ -833,6 +1002,43 @@ struct ParsedSource {
     repo_url: String,
     reference: String,
     subpath: PathBuf,
+}
+
+/// Derive a default namespace from the source URL when the
+/// `[[source]] namespace = "..."` override isn't set in the registry
+/// index TOML.
+///
+/// For `gh:owner/repo[@ref]/path` the namespace is `owner`. For
+/// `<alias>:owner/repo[@ref]/path` (git-host registry alias form)
+/// the namespace is likewise `owner`. Returns None when no
+/// reasonable owner can be extracted, or when the extracted owner
+/// doesn't satisfy validate_skill_name (e.g. an org with uppercase
+/// characters can't safely round-trip through the URL path); the
+/// operator must set an explicit override in those cases.
+///
+/// This is best-effort intentionally — namespacing is a curator's
+/// responsibility, not the parser's. An override in TOML always
+/// trumps inference.
+fn infer_namespace_from_source(source: &str) -> Option<String> {
+    let rest = if let Some(spec) = source.strip_prefix("gh:") {
+        spec
+    } else {
+        // alias:owner/repo[/path]
+        let (_alias, rest) = source.split_once(':')?;
+        rest
+    };
+    let owner = rest.split('/').next()?;
+    // Strip an @ref attached to the owner segment defensively;
+    // real-world specs put the ref on the repo segment, not the
+    // owner, but this guards against malformed input.
+    let owner = owner.split_once('@').map_or(owner, |(o, _)| o);
+    if owner.is_empty() {
+        return None;
+    }
+    // Must satisfy the kebab-case rules to be URL-safe and to
+    // round-trip through validate_skill_name on the client side.
+    validate_skill_name(owner).ok()?;
+    Some(owner.to_string())
 }
 
 fn parse_source(source: &str, source_aliases: &BTreeMap<String, String>) -> Result<ParsedSource> {
