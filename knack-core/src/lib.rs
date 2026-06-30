@@ -356,6 +356,18 @@ pub struct IndexedSkill {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IndexSource {
     pub source: String,
+
+    /// Optional explicit namespace override for skills materialised
+    /// from this source. When set, all skills walked under this
+    /// source's tree get scoped as `<namespace>/<skill-name>`. When
+    /// omitted, knack-registry derives a namespace from the source
+    /// URL itself (typically the gh:owner segment). The override
+    /// matters for cases like `gh:ajac-zero/knack/skills` where the
+    /// owner segment ("ajac-zero") isn't the brand we want users to
+    /// install under ("knack"). Same kebab-case rules as skill names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+
     #[serde(default)]
     pub tags: Vec<String>,
 }

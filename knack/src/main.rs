@@ -1195,10 +1195,11 @@ fn add_skill(manifest_path: &Path, source: &str, default_target: &Path) -> Resul
         &mut lockfile,
         LockedSkill {
             name: installed.name.clone(),
-            // Namespace plumbing through install lands in the
-            // install-command parser commit; leave None until that
-            // commit threads the parsed namespace through here.
-            namespace: None,
+            // Captured from the registry's X-Knack-Namespace response
+            // header (set by namespacing-aware registries). None for
+            // legacy registries and gh:/git+/local installs — both
+            // round-trip fine through the lockfile (skip-serialize).
+            namespace: installed.namespace.clone(),
             source: source.to_string(),
             resolved: locked_resolved,
             checksum: checksum_dir(&installed.path)?,
@@ -1333,10 +1334,7 @@ fn sync_skills(manifest_path: &Path) -> Result<()> {
             &mut lockfile,
             LockedSkill {
                 name: installed.name.clone(),
-                // Namespace lands in the next commit (install-command
-                // parser); leave None for the pure data-model
-                // addition of this commit.
-                namespace: None,
+                namespace: installed.namespace.clone(),
                 source: source.clone(),
                 resolved: locked_resolved,
                 checksum: checksum_dir(&installed.path)?,
@@ -1449,9 +1447,7 @@ fn update_skills(
             &mut lockfile,
             LockedSkill {
                 name: installed.name.clone(),
-                // See sibling comment: namespace threading lands in
-                // the install-command parser commit.
-                namespace: None,
+                namespace: installed.namespace.clone(),
                 source: source.clone(),
                 resolved: locked_resolved,
                 checksum: new_checksum.clone(),
@@ -1574,12 +1570,36 @@ fn resolve_source_alias(source: &str, manifest: &Manifest, manifest_path: &Path)
     }
 }
 
+/// Accepts two install-command shapes for HTTP registries:
+///
+/// - `alias:namespace/name` — the canonical form once a registry
+///   has been re-materialised with namespacing. Both segments must
+///   be valid kebab-case identifiers; we construct the namespaced
+///   archive URL `/skills/<namespace>/<name>/archive`.
+/// - `alias:name` — legacy unscoped form. We construct
+///   `/skills/<name>/archive` and let the registry resolve the
+///   ambiguity server-side (it 200s when exactly one namespaced
+///   entry matches, 409s with a disambiguation hint when several do,
+///   404s otherwise). This keeps existing manifests / lockfiles
+///   working against the upgraded registry without forcing every
+///   user to rewrite every `source = "alias:name"`.
 fn resolve_http_alias(registry: &RegistryConfig, rest: &str) -> Result<String> {
-    validate_skill_name(rest)?;
+    let path = if let Some((namespace, name)) = rest.split_once('/') {
+        if name.contains('/') {
+            bail!("invalid install source `{rest}`: namespace/name must contain exactly one `/`");
+        }
+        validate_skill_name(namespace)
+            .map_err(|err| anyhow!("invalid namespace `{namespace}`: {err}"))?;
+        validate_skill_name(name)?;
+        format!("{namespace}/{name}")
+    } else {
+        validate_skill_name(rest)?;
+        rest.to_string()
+    };
     Ok(format!(
         "http+knack:{}/skills/{}/archive",
         registry.url.trim_end_matches('/'),
-        rest
+        path
     ))
 }
 
@@ -1661,6 +1681,15 @@ struct InstalledSkill {
     /// field into a content-addressed form so peers get the same
     /// commit on `knack sync`.
     resolved_sha: Option<String>,
+
+    /// Namespace captured from the registry response (the
+    /// `X-Knack-Namespace` header). Set when an HTTP registry served
+    /// the archive under a namespaced or legacy URL and reported the
+    /// canonical scope. Threaded into the lockfile so subsequent
+    /// `knack sync` invocations construct the namespaced URL directly
+    /// without the registry's bare-name fallback. None for gh:/git+/
+    /// local installs, where namespacing isn't a registry concept.
+    namespace: Option<String>,
 }
 
 /// Install from `primary`, but if that fails AND `primary` had a
@@ -1780,27 +1809,52 @@ fn install_http_skill_archive(url: &str, target: &Path) -> Result<InstalledSkill
         .filter(|s| looks_like_sha(s))
         .map(String::from);
 
+    // X-Knack-Namespace is the registry's report of the canonical
+    // namespace under which the served archive lives. It's set when
+    // the registry maps a bare `<name>` request to a namespaced
+    // entry, and also when the request itself was already namespaced
+    // (registry echoes the namespace verbatim). Captured into the
+    // lockfile so subsequent syncs construct the namespaced URL
+    // directly instead of leaning on bare-name resolution again.
+    // Old registries (pre-namespacing) don't set this header; we
+    // gracefully degrade to None there.
+    let namespace = response
+        .headers()
+        .get("x-knack-namespace")
+        .and_then(|value| value.to_str().ok())
+        .filter(|s| validate_skill_name(s).is_ok())
+        .map(String::from);
+
     let bytes = response.bytes().context("failed to read skill archive")?;
     let mut installed =
         install_archive_reader(flate2::read::GzDecoder::new(Cursor::new(bytes)), target)?;
     installed.resolved_sha = resolved_sha;
+    installed.namespace = namespace;
     Ok(installed)
 }
 
-/// Recover the skill name from an HTTP knack archive URL of the shape
-/// `<base>/skills/<name>/archive`. Returns None for any other shape so the
-/// caller can fall back to a generic hint instead of producing nonsense.
+/// Recover the user-typed identifier from an HTTP knack archive URL.
+/// Handles both URL shapes:
+///   `<base>/skills/<name>/archive`             → returns `"name"`
+///   `<base>/skills/<namespace>/<name>/archive` → returns `"namespace/name"`
+/// Returns None for any other shape so the caller can fall back to a
+/// generic hint instead of producing nonsense.
 fn extract_archive_skill_name(url: &str) -> Option<&str> {
     let trimmed = url.strip_suffix("/archive")?;
-    let name = trimmed.rsplit('/').next()?;
-    let prefix = trimmed.strip_suffix(name)?.strip_suffix('/')?;
-    if !prefix.ends_with("/skills") {
-        return None;
-    }
-    if name.is_empty() {
-        return None;
-    }
-    Some(name)
+    let after_skills = {
+        // Find the "/skills/" segment and return whatever follows it,
+        // up to the trailing slash before /archive. Searching rather
+        // than splitting from the right lets us correctly handle both
+        // the legacy single-segment and the new ns/name forms.
+        let needle = "/skills/";
+        let start = trimmed.rfind(needle)? + needle.len();
+        let candidate = &trimmed[start..];
+        if candidate.is_empty() || candidate.contains("//") {
+            return None;
+        }
+        candidate
+    };
+    Some(after_skills)
 }
 
 fn install_archive_reader<R: std::io::Read>(reader: R, target: &Path) -> Result<InstalledSkill> {
@@ -2110,6 +2164,11 @@ fn install_skill_dir(source: &Path, target: &Path) -> Result<InstalledSkill> {
         name: skill.name,
         path: destination,
         resolved_sha: None,
+        // Local / gh: / git+ installs aren't served by a registry, so
+        // there's no X-Knack-Namespace to capture. The HTTP install
+        // path (install_http_skill_archive) sets this from the
+        // response header before returning.
+        namespace: None,
     })
 }
 
