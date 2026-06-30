@@ -47,6 +47,23 @@
 # trustworthy skills than 5000 noisy ones.
 #
 # ======================================================================
+# Tier 0 — knack itself (dogfood)
+# ======================================================================
+# Skills authored alongside knack and published from this repo. The
+# explicit `namespace = "knack"` override is what lets users install
+# via `knack add public:knack/find-skills` rather than the wordier
+# (auto-inferred) `public:ajac-zero/find-skills` — the gh: owner
+# isn't the brand we want to advertise under.
+
+[[source]]
+source = "gh:ajac-zero/knack/skills"
+namespace = "knack"
+tags = ["official", "knack"]
+# 1 skill: find-skills (teaches agents to use knack to discover and
+# install other skills). Coexists with vercel-labs/find-skills under
+# a different namespace; both surface in `knack find find-skills`.
+
+# ======================================================================
 # Tier 1 — vendor-official
 # ======================================================================
 
