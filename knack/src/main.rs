@@ -501,8 +501,11 @@ fn notice(message: &str) {
 fn label_value(label: &str, value: impl fmt::Display) {
     let label_style = label_style();
     let value_style = accent_style();
+    // Column width of 10 accommodates the longest label currently in
+    // use ("namespace:" added with namespacing). Shorter labels get
+    // trailing space padding so values align across rows.
     anstream::println!(
-        "  {label_style}{label:<9}{label_style:#} {value_style}{value}{value_style:#}"
+        "  {label_style}{label:<10}{label_style:#} {value_style}{value}{value_style:#}"
     );
 }
 
@@ -852,8 +855,16 @@ fn find_registry_skills(explicit_manifest: Option<&Path>, query: &str) -> Result
         let results = search_http_registry(&registry.url, query)
             .with_context(|| format!("failed to search registry {name}"))?;
         for skill in results {
-            let source = format!("{}:{}", name, skill.name);
-            matches.push((skill.name, name.clone(), source));
+            // qualified_name() returns "<namespace>/<name>" when the
+            // registry attributed the skill to a namespace, bare
+            // "<name>" otherwise. The registry's /search endpoint
+            // already rewrites skill.source to this exact form, but
+            // we recompute defensively in case the registry response
+            // isn't rewriting (e.g. operator forgot --name on the
+            // server, or a non-knack registry compatible at the
+            // protocol level but not at the rewrite layer).
+            let source = format!("{}:{}", name, skill.qualified_name());
+            matches.push((skill.name, skill.namespace, name.clone(), source));
         }
     }
 
@@ -869,14 +880,21 @@ fn find_registry_skills(explicit_manifest: Option<&Path>, query: &str) -> Result
         matches.len(),
         if matches.len() == 1 { "" } else { "s" }
     );
-    for (skill_name, registry_name, source) in matches {
+    for (skill_name, namespace, registry_name, source) in matches {
         let skill_style = accent_style();
         anstream::println!("\n{skill_style}{skill_name}{skill_style:#}");
+        // Namespace surfaces under the skill name so users see who
+        // attributed the skill (the vendor scope) before they pick
+        // one to install. Omitted when None — the registry doesn't
+        // namespace the entry, so we don't show a stale empty field.
+        if let Some(ns) = namespace {
+            label_value("namespace:", ns);
+        }
         label_value("registry:", registry_name);
         let label_style = label_style();
         let source_style = accent_style();
         anstream::println!(
-            "  {label_style}{:<9}{label_style:#} knack add {source_style}{}{source_style:#}",
+            "  {label_style}{:<10}{label_style:#} knack add {source_style}{}{source_style:#}",
             "install:",
             source
         );
