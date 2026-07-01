@@ -845,9 +845,15 @@ fn find_registry_skills(explicit_manifest: Option<&Path>, query: &str) -> Result
 
     let (manifest, manifest_path) = read_manifest_for_read(explicit_manifest)?;
     let registries = effective_registries(&manifest, &manifest_path)?;
+    // When the match's registry equals the effective default we can
+    // suggest the short bare form (`knack add anthropics/pdf`) — a
+    // teaching-by-example nudge toward the more ergonomic syntax.
+    // For any other registry we keep the fully-qualified form so the
+    // command works regardless of the user's default config.
+    let default_registry = effective_default_registry(&manifest, &manifest_path, &registries)?;
     let mut matches = Vec::new();
 
-    for (name, registry) in registries {
+    for (name, registry) in &registries {
         if !matches!(registry.kind, RegistryKind::Http) {
             continue;
         }
@@ -863,7 +869,14 @@ fn find_registry_skills(explicit_manifest: Option<&Path>, query: &str) -> Result
             // isn't rewriting (e.g. operator forgot --name on the
             // server, or a non-knack registry compatible at the
             // protocol level but not at the rewrite layer).
-            let source = format!("{}:{}", name, skill.qualified_name());
+            let qualified = skill.qualified_name();
+            let source = if default_registry.as_deref() == Some(name.as_str()) {
+                // Bare form (no registry prefix) — resolves through
+                // default_registry on install.
+                qualified.clone()
+            } else {
+                format!("{name}:{qualified}")
+            };
             matches.push((skill.name, skill.namespace, name.clone(), source));
         }
     }
@@ -1074,6 +1087,12 @@ fn init_manifest(manifest_path: &Path, target: &Path, bootstrap_public: bool) ->
                 default_ref: "main".to_string(),
             },
         );
+        // Set the seeded public registry as the default so bare
+        // install commands (`knack add anthropics/pdf`) resolve
+        // without users having to type the `public:` prefix. Matches
+        // the cargo/npm mental model where the well-known registry
+        // is the implicit default.
+        manifest.install.default_registry = Some(PUBLIC_REGISTRY_NAME.to_string());
     }
     write_manifest(manifest_path, &manifest)?;
     status("created manifest:", manifest_path.display());
@@ -1081,6 +1100,10 @@ fn init_manifest(manifest_path: &Path, target: &Path, bootstrap_public: bool) ->
         status(
             "seeded registry:",
             format!("{PUBLIC_REGISTRY_NAME} ({PUBLIC_REGISTRY_URL})"),
+        );
+        status(
+            "default registry:",
+            format!("{PUBLIC_REGISTRY_NAME} (bare `knack add ns/name` resolves via this)"),
         );
     }
     Ok(())
@@ -1563,29 +1586,104 @@ fn resolve_source_alias(source: &str, manifest: &Manifest, manifest_path: &Path)
         return Ok(source.to_string());
     }
 
-    let Some((alias, rest)) = source.split_once(':') else {
-        return Ok(source.to_string());
-    };
     let registries = effective_registries(manifest, manifest_path)?;
-    let Some(registry) = registries.get(alias) else {
-        // Reject the source rather than falling through to install_local_skill,
-        // whose "install source does not exist" diagnostic gives no hint that
-        // the user probably meant a registry alias. Only trigger when the
-        // prefix actually looks like a valid alias name; that lets exotic
-        // local paths containing ':' continue to pass through.
-        if validate_registry_name(alias).is_ok() {
-            bail!(
-                "no registry registered as `{alias}` (resolving source `{source}`); {}",
-                unknown_registry_hint(&registries),
-            );
-        }
-        return Ok(source.to_string());
-    };
 
-    match registry.kind {
-        RegistryKind::GitHost => resolve_git_host_alias(registry, rest),
-        RegistryKind::Http => resolve_http_alias(registry, rest),
+    if let Some((alias, rest)) = source.split_once(':') {
+        let Some(registry) = registries.get(alias) else {
+            // Reject rather than falling through to install_local_skill,
+            // whose "install source does not exist" diagnostic gives no
+            // hint that the user probably meant a registry alias. Only
+            // trigger when the prefix actually looks like a valid alias
+            // name; that lets exotic local paths containing ':' continue
+            // to pass through.
+            if validate_registry_name(alias).is_ok() {
+                bail!(
+                    "no registry registered as `{alias}` (resolving source `{source}`); {}",
+                    unknown_registry_hint(&registries),
+                );
+            }
+            return Ok(source.to_string());
+        };
+        return match registry.kind {
+            RegistryKind::GitHost => resolve_git_host_alias(registry, rest),
+            RegistryKind::Http => resolve_http_alias(registry, rest),
+        };
     }
+
+    // No scheme, no `:`, not a local path — try the default registry.
+    // Two accepted shapes here:
+    //   `namespace/name` → resolves as `<default>:namespace/name`
+    //   `name`           → resolves as `<default>:name` (registry
+    //                      soft-resolves against its own namespace(s))
+    // This is what enables the cargo-style ergonomic:
+    //   knack add anthropics/pdf   (vs. explicit knack add public:anthropics/pdf)
+    if let Some(default_alias) = effective_default_registry(manifest, manifest_path, &registries)? {
+        let Some(registry) = registries.get(&default_alias) else {
+            bail!(
+                "default_registry `{default_alias}` is set but no registry \
+                 with that alias is configured; fix `install.default_registry` \
+                 in {} or run `knack registry add`",
+                manifest_path.display(),
+            );
+        };
+        return match registry.kind {
+            RegistryKind::GitHost => resolve_git_host_alias(registry, source),
+            RegistryKind::Http => resolve_http_alias(registry, source),
+        };
+    }
+
+    // No scheme, no `:`, not a local path, no default registry. Fall
+    // through — install_local_skill will produce the existing "install
+    // source does not exist" error with the un-resolved string, which
+    // is at least honest.
+    Ok(source.to_string())
+}
+
+/// Compute the effective default registry for a bare install command:
+///
+/// 1. `install.default_registry` set in the manifest wins.
+/// 2. Otherwise, if exactly ONE registry is configured, auto-default
+///    to that. Users with a single-registry setup shouldn't have to
+///    write config to get the good UX.
+/// 3. Otherwise (multi-registry, no explicit default) → None. The
+///    caller falls back to the "install source does not exist" error
+///    with the raw source string so the user can decide whether they
+///    meant a local path they forgot to prefix with `./` or a
+///    registry install they need to fully qualify.
+fn effective_default_registry(
+    manifest: &Manifest,
+    manifest_path: &Path,
+    registries: &std::collections::BTreeMap<String, RegistryConfig>,
+) -> Result<Option<String>> {
+    // The manifest passed in is the caller's chosen scope (usually
+    // project or global). Also honour any default_registry set in the
+    // OTHER scope files via the same layering effective_registries()
+    // uses, so a global default is visible from a project without one
+    // and vice versa. Precedence: project > global > system.
+    if let Some(alias) = &manifest.install.default_registry {
+        return Ok(Some(alias.clone()));
+    }
+
+    for scope in [Scope::Project, Scope::Global, Scope::System] {
+        let scope_path = scope.manifest_path()?;
+        // Skip the manifest we already checked to avoid re-reading it.
+        if scope_path == manifest_path {
+            continue;
+        }
+        if let Ok(scoped) = read_manifest(&scope_path) {
+            if let Some(alias) = scoped.install.default_registry {
+                return Ok(Some(alias));
+            }
+        }
+    }
+
+    // No explicit default anywhere — fall back to "the one and only
+    // registry" if that's what the caller has configured.
+    if registries.len() == 1 {
+        return Ok(Some(registries.keys().next().unwrap().clone()));
+    }
+
+    Ok(None)
 }
 
 /// Accepts two install-command shapes for HTTP registries:
@@ -1796,19 +1894,39 @@ fn install_http_skill_archive(url: &str, target: &Path) -> Result<InstalledSkill
 
     // Translate 404 into an actionable diagnostic. The HTTP knack URL
     // produced by resolve_http_alias has the shape
-    // `http://...../skills/<name>/archive`, so we can usually recover
-    // the skill name and point the user at `knack find` for discovery.
+    // `http://...../skills/<name>/archive` or
+    // `http://...../skills/<namespace>/<name>/archive`, so we can
+    // usually recover the identifier and point the user at
+    // `knack find` for discovery. Also mention the local-path
+    // fallback: bare `knack add foo/bar` now resolves via the
+    // default registry (see resolve_source_alias), so users who
+    // meant a local dir need to prefix with `./` to disambiguate.
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         let hint = match extract_archive_skill_name(request_url) {
             Some(name) => format!(
                 "skill `{name}` not found on the registry; \
-                 try `knack find {name}` to look for related skills"
+                 try `knack find {name}` to look for related skills, \
+                 or if you meant a local directory prefix it with `./`"
             ),
             None => "the registry has no skill at that URL; \
                      try `knack find <query>` to discover skills"
                 .to_string(),
         };
         bail!("{hint} ({request_url})");
+    }
+
+    // 409 Conflict comes from the namespacing soft-resolve when a
+    // bare-name request matches multiple namespaced skills. The
+    // registry response body carries the disambiguation hint (list
+    // of qualified forms); surface it verbatim so the user sees the
+    // exact namespaced identifiers they can retry with. Without
+    // this, reqwest's `error_for_status()` swallows the body and
+    // the user just sees "409 Conflict" — useless.
+    if response.status() == reqwest::StatusCode::CONFLICT {
+        let body = response
+            .text()
+            .unwrap_or_else(|_| "(unable to read registry response body)".to_string());
+        bail!("{body} ({request_url})");
     }
 
     let response = response

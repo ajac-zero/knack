@@ -210,7 +210,10 @@ pub struct Manifest {
 impl Manifest {
     pub fn new(target: PathBuf) -> Self {
         Self {
-            install: InstallConfig { target },
+            install: InstallConfig {
+                target,
+                default_registry: None,
+            },
             skills: BTreeMap::new(),
             registries: BTreeMap::new(),
         }
@@ -220,6 +223,23 @@ impl Manifest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InstallConfig {
     pub target: PathBuf,
+
+    /// Registry alias used to resolve bare install sources that omit
+    /// the `<registry>:` prefix. Set via `knack init` (defaults to
+    /// `"public"` when the public registry is seeded) or by hand.
+    ///
+    /// With this set to `"public"`, `knack add anthropics/pdf`
+    /// resolves the same as `knack add public:anthropics/pdf`, and
+    /// `knack add pdf` resolves as `knack add public:pdf` (which the
+    /// registry then soft-resolves under its own namespace via
+    /// X-Knack-Namespace). None means "no implicit default"; the CLI
+    /// falls back to auto-defaulting when exactly one registry is
+    /// configured, and errors on ambiguity otherwise.
+    ///
+    /// Layered through the system → global → project scopes like
+    /// `[registries.*]`, last-write-wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_registry: Option<String>,
 }
 
 /// Current lockfile schema version. Bump when the on-disk layout

@@ -52,7 +52,15 @@ Initialize a project manifest:
 knack init
 ```
 
-This seeds the public knack registry (`public` → `https://knack.ajac-zero.com`) into the new manifest so you can `knack find <term>` and `knack add public:<name>` immediately. Pass `--no-public-registry` to skip if you want a bare manifest or only intend to use an internal registry. Either way, you can remove the bootstrapped entry later with `knack registry remove public`.
+This seeds the public knack registry (`public` → `https://knack.ajac-zero.com`) into the new manifest AND sets it as the default so you can `knack find <term>` and `knack add <namespace>/<name>` immediately without needing to type the `public:` prefix. Pass `--no-public-registry` to skip if you want a bare manifest or only intend to use an internal registry. Either way, you can remove the bootstrapped entry later with `knack registry remove public` (and drop `default_registry` from `[install]` or point it at a different alias).
+
+Install commands accept three shapes:
+
+- `knack add anthropics/pdf` — bare, resolved via the manifest's `install.default_registry`. Shortest form; recommended for interactive use.
+- `knack add public:anthropics/pdf` — explicit registry prefix. Works regardless of default config; use in scripts and shared docs where you don't want to depend on the reader's config.
+- `knack add gh:anthropics/skills/skills/pdf` — direct GitHub install, bypasses any registry.
+
+If no `default_registry` is set but exactly one registry is configured, that registry becomes the implicit default automatically. Multi-registry setups with no explicit default require the fully-qualified form.
 
 By default, commands use project scope:
 
