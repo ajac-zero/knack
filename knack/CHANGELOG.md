@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/ajac-zero/knack/compare/knack-v0.3.0...knack-v0.3.1) - 2026-07-10
+
+### Added
+
+- *(core)* discount common query terms via IDF weighting in search ranking
+
 ## [0.3.0](https://github.com/ajac-zero/knack/compare/knack-v0.2.2...knack-v0.3.0) - 2026-07-10
 
 ### Added
