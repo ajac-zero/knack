@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/ajac-zero/knack/compare/knack-registry-v0.2.2...knack-registry-v0.3.0) - 2026-07-10
+
+### Added
+
+- *(cli)* show descriptions, cap and rank find output, tolerate registry failures
+- *(registry)* surface match score in search results
+- *(cli)* default_registry — bare install commands (knack add ns/name) resolve without alias prefix
+- *(registry)* [**breaking**] end-to-end namespacing — materialize, routes, and build-static layout
+- *(core)* [**breaking**] add namespace field across IndexedSkill + LockedSkill, lockfile v2
+
 ## [0.2.2](https://github.com/ajac-zero/knack/compare/knack-registry-v0.2.1...knack-registry-v0.2.2) - 2026-06-29
 
 ### Added
