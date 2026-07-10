@@ -107,7 +107,7 @@ That lets administrators inject aliases such as `tea:` for all users while still
 
 Read-only commands (`knack find`, `knack registry list`) search the merged set of registries from all three layers automatically. They work from a directory with no project manifest, so a globally-registered `company:` alias is reachable without an explicit `-g`.
 
-`knack find <query>` ranks results best-match-first: a hit in a skill's name or tags outranks one that only appears incidentally in its description, and each result shows its description so you can tell why it matched without installing it first. Output is capped at 10 matches by default — pass `--limit N` to see more. If one of your configured registries is unreachable, `find` warns and keeps going with the rest rather than failing the whole command.
+`knack find <query>` ranks results best-match-first: a hit in a skill's name or tags outranks one that only appears incidentally in its description, and terms that are common across the registry (e.g. "deploy") are discounted relative to terms that are rare and therefore more discriminating, so a query for a generic word doesn't surface every skill that happens to mention it once in passing. Each result shows its description so you can tell why it matched without installing it first. Output is capped at 10 matches by default — pass `--limit N` to see more. If one of your configured registries is unreachable, `find` warns and keeps going with the rest rather than failing the whole command.
 
 Add and install a skill source into the manifest target:
 

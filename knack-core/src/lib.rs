@@ -416,13 +416,18 @@ impl RegistryIndex {
     /// Scores and ranks skills against a whitespace-separated query.
     /// Every term must match *somewhere* in a skill (name, namespace,
     /// description, or tags) for the skill to be included at all —
-    /// same AND semantics as before. What's new is *where* a term
-    /// matched now affects ranking: a hit in the name or tags counts
-    /// for much more than a hit buried in the description, so a
-    /// query term that merely appears in unrelated prose no longer
-    /// ranks a skill as highly as one that's actually about that
-    /// term. Results are sorted best-match-first (ties broken
-    /// alphabetically by `qualified_name()` for stable output).
+    /// same AND semantics as before. Where a term matched affects
+    /// ranking (a hit in the name or tags counts for much more than
+    /// a hit buried in the description), and so does *how common*
+    /// the term is across the whole index: a generic word that shows
+    /// up in most skills' descriptions (e.g. "deploy") contributes
+    /// far less to the score than a term that's genuinely
+    /// distinctive, via a BM25-style inverse-document-frequency
+    /// weight computed per query. This keeps a broad, common query
+    /// term from single-handedly promoting every skill that happens
+    /// to mention it once in passing. Results are sorted
+    /// best-match-first (ties broken alphabetically by
+    /// `qualified_name()` for stable output).
     pub fn search(&self, query: &str) -> Vec<(&IndexedSkill, f64)> {
         let terms: Vec<String> = query
             .split_whitespace()
@@ -432,10 +437,33 @@ impl RegistryIndex {
             return Vec::new();
         }
 
+        let total_skills = self.skill.len();
+        // Document frequency per term: how many skills the term
+        // matches *somewhere*, independent of the other query terms.
+        // This is what lets a term's own weight reflect how
+        // discriminating it is across this specific index, rather
+        // than using a single fixed weight for every term regardless
+        // of how common it is.
+        let idf_weights: Vec<f64> = terms
+            .iter()
+            .map(|term| {
+                let doc_freq = self
+                    .skill
+                    .iter()
+                    .filter(|skill| skill.matches_term(term))
+                    .count();
+                inverse_document_frequency(total_skills, doc_freq)
+            })
+            .collect();
+
         let mut scored: Vec<(&IndexedSkill, f64)> = self
             .skill
             .iter()
-            .filter_map(|skill| skill.match_score(&terms).map(|score| (skill, score)))
+            .filter_map(|skill| {
+                skill
+                    .match_score(&terms, &idf_weights)
+                    .map(|score| (skill, score))
+            })
             .collect();
 
         scored.sort_by(|(a, a_score), (b, b_score)| {
@@ -446,6 +474,26 @@ impl RegistryIndex {
         });
         scored
     }
+}
+
+/// BM25-style smoothed inverse document frequency: `ln(1 + (N - df +
+/// 0.5) / (df + 0.5))`. A term present in only a handful of skills
+/// (small `df`) gets a large weight; a term present in most or all
+/// skills (large `df`, up to `N`) gets a small-but-positive weight —
+/// it never zeroes out entirely (a query term still had to match for
+/// the skill to be included at all via the AND filter in
+/// `match_score`), but it stops dominating the ranking the way a
+/// flat per-field weight would. `df` is expected to be at least 1
+/// here (only called for terms that matched something); `N == 0` or
+/// `df == 0` fall back to a neutral weight of `1.0` as a defensive
+/// guard rather than dividing by zero.
+fn inverse_document_frequency(total_skills: usize, doc_freq: usize) -> f64 {
+    if total_skills == 0 || doc_freq == 0 {
+        return 1.0;
+    }
+    let n = total_skills as f64;
+    let df = doc_freq as f64;
+    (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
 }
 
 impl IndexSource {
@@ -515,11 +563,12 @@ impl IndexedSkill {
         }
     }
 
-    /// Sums, per term, the best weight found across name/namespace/
-    /// tags/description. Returns `None` if any term matched nowhere
-    /// (preserving the previous AND-of-substrings filtering
-    /// behaviour), `Some(total_score)` otherwise.
-    fn match_score(&self, terms: &[String]) -> Option<f64> {
+    /// Best weight found for one already-lowercased `term` across
+    /// name/namespace/tags/description, or `0.0` if it matches
+    /// nowhere. Factored out of `match_score` so document-frequency
+    /// counting (`matches_term`) and scoring can share the same
+    /// per-field logic instead of drifting apart.
+    fn best_field_weight(&self, term: &str) -> f64 {
         let name = self.name.to_ascii_lowercase();
         let namespace = self
             .namespace
@@ -527,21 +576,38 @@ impl IndexedSkill {
             .map(|ns| ns.to_ascii_lowercase())
             .unwrap_or_default();
         let description = self.description.to_ascii_lowercase();
-        let tags: Vec<String> = self.tags.iter().map(|t| t.to_ascii_lowercase()).collect();
 
+        let mut best = Self::field_weight(term, &name, true);
+        best = best.max(Self::field_weight(term, &namespace, true));
+        for tag in &self.tags {
+            best = best.max(Self::field_weight(term, &tag.to_ascii_lowercase(), true));
+        }
+        best.max(Self::field_weight(term, &description, false))
+    }
+
+    /// Whether an already-lowercased `term` matches this skill
+    /// anywhere at all, independent of any other query terms. Used
+    /// to compute each term's document frequency across the whole
+    /// index for IDF weighting.
+    fn matches_term(&self, term: &str) -> bool {
+        self.best_field_weight(term) > 0.0
+    }
+
+    /// Sums, per term, the best field weight found across
+    /// name/namespace/tags/description, scaled by that term's IDF
+    /// weight (`idf_weights[i]`, aligned by position with `terms`)
+    /// so common terms contribute less than distinctive ones.
+    /// Returns `None` if any term matched nowhere (preserving the
+    /// AND-of-substrings filtering behaviour), `Some(total_score)`
+    /// otherwise.
+    fn match_score(&self, terms: &[String], idf_weights: &[f64]) -> Option<f64> {
         let mut total = 0.0;
-        for term in terms {
-            let mut best = Self::field_weight(term, &name, true);
-            best = best.max(Self::field_weight(term, &namespace, true));
-            for tag in &tags {
-                best = best.max(Self::field_weight(term, tag, true));
-            }
-            best = best.max(Self::field_weight(term, &description, false));
-
+        for (term, idf) in terms.iter().zip(idf_weights) {
+            let best = self.best_field_weight(term);
             if best <= 0.0 {
                 return None;
             }
-            total += best;
+            total += best * idf;
         }
         Some(total)
     }
@@ -740,6 +806,65 @@ mod tests {
         let results = index.search("rust");
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0.name, "rust-code-review");
+        assert!(results[0].1 > results[1].1);
+    }
+
+    #[test]
+    fn discounts_common_terms_against_rare_terms_via_idf() {
+        // Two-term query "ci deploy" where "ci" is rare across the
+        // index but "deploy" is common (mentioned in passing by many
+        // unrelated skills' descriptions). Skill `x` matches the
+        // *rare* term strongly (exact tag) and the common term only
+        // weakly (description substring); skill `y` is the mirror
+        // image — strong on the *common* term, weak on the rare one.
+        // Their flat, un-weighted field scores are equal (4.0 + 0.5
+        // each way), so without IDF weighting they'd tie. With IDF,
+        // `x`'s strong hit on the rarer, more discriminating term
+        // should outrank `y`'s strong hit on the term that's common
+        // enough to appear almost everywhere.
+        let mut skill = vec![
+            IndexedSkill {
+                name: "ci-tools".to_string(),
+                namespace: None,
+                description: "Helps deploy your pipeline safely.".to_string(),
+                source: "ci-tools".to_string(),
+                tags: vec!["ci".to_string()],
+                score: None,
+            },
+            IndexedSkill {
+                name: "deploy".to_string(),
+                namespace: None,
+                description: "Also handles some ci related tasks.".to_string(),
+                source: "deploy".to_string(),
+                tags: vec!["deploy".to_string()],
+                score: None,
+            },
+        ];
+        // Filler skills that mention "deploy" in passing (inflating
+        // its document frequency) but never "ci", so "ci" stays rare
+        // relative to "deploy" across the whole index.
+        for i in 0..15 {
+            skill.push(IndexedSkill {
+                name: format!("filler-{i}"),
+                namespace: None,
+                description: "Handles deployment automation for unrelated workflows.".to_string(),
+                source: format!("filler-{i}"),
+                tags: vec![],
+                score: None,
+            });
+        }
+        let index = RegistryIndex {
+            skill,
+            source: Vec::new(),
+        };
+
+        let results = index.search("ci deploy");
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].0.name, "ci-tools",
+            "strong match on the rarer, more discriminating term should outrank \
+             a strong match on the term that's common across the index"
+        );
         assert!(results[0].1 > results[1].1);
     }
 
