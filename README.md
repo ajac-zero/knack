@@ -437,5 +437,4 @@ Implemented:
 
 Not implemented yet:
 
-- Static registries.
 - Signing, provenance, and policy checks.
