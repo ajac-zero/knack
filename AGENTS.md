@@ -10,13 +10,14 @@ registry for Agent Skills.
 
 ## Workspace shape
 
-Three crates (Cargo workspace, edition 2024, `resolver = "3"`):
+Four crates (Cargo workspace, edition 2024, `resolver = "3"`):
 
 - `knack/` — produces the `knack` binary (this is the published CLI crate).
 - `knack-registry/` — produces the `knack-registry` binary.
-- `knack-core/` — shared library; **the only crate with unit tests** (4 in `src/lib.rs`).
+- `knack-core/` — shared library; unit tests live in `src/lib.rs` (search/ranking, frontmatter parsing, lockfile versioning, etc.).
+- `knack-search-wasm/` — thin `wasm32-unknown-unknown` bindings around `knack_core::RegistryIndex::search`, `publish = false` (not a crates.io package). Exists so a *static* registry deployment (an edge Worker serving a snapshot from `knack-registry build-static`, e.g. `examples/cloudflare-worker/`) can share knack-core's exact matching/ranking algorithm instead of a hand-rolled JS reimplementation that can drift out of sync. Built via `examples/cloudflare-worker/build.sh` (`cargo build --target wasm32-unknown-unknown` + `wasm-bindgen --target bundler`); the generated `pkg/` is gitignored, same as `/target`.
 
-Async/sync split: **CLI uses `reqwest` blocking**; **registry uses `tokio`/`axum` async**. Don't pull tokio into the CLI or blocking I/O into the registry.
+Async/sync split: **CLI uses `reqwest` blocking**; **registry uses `tokio`/`axum` async**. Don't pull tokio into the CLI or blocking I/O into the registry. `knack-search-wasm` stays synchronous too (no tokio, no reqwest) so it stays WASM-compatible.
 
 ## Commands
 

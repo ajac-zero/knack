@@ -12,18 +12,22 @@
 //        skills/<namespace>/<name>.skill.tar.gz   ← scoped (namespacing-aware)
 //        skills/<name>.skill.tar.gz               ← unscoped (legacy)
 //   3. Bind the bucket as `BUCKET` in wrangler.toml.
-//   4. Deploy this worker.
+//   4. Deploy this worker. `wrangler dev`/`wrangler deploy` runs
+//      build.sh first (see wrangler.toml's [build] block), which
+//      compiles knack-search-wasm and drops its JS glue into ./pkg.
 //
 // Endpoints implemented:
 //   GET /info                              -> info.json
 //   GET /index                             -> index.json
-//   GET /search?q=<terms>                  -> filters index.json server-side
+//   GET /search?q=<terms>                  -> ranks index.json via knack-search-wasm
 //   GET /skills/<ns>/<name>/archive        -> namespaced; direct R2 lookup
 //   GET /skills/<name>/archive             -> legacy; soft-resolves via index
 //
 // All responses are cached at the edge. Set `CACHE_TTL_SECONDS` to control
 // how aggressively. The default is 60s, which balances staleness against
 // origin (R2) load. Static files at this scale fit easily in free tier.
+
+import { search as wasmSearch } from './pkg/knack_search_wasm.js';
 
 const CACHE_TTL_SECONDS = 60;
 
@@ -88,18 +92,24 @@ async function serveJsonFromR2(env, key) {
     });
 }
 
-// Mirrors knack-core's IndexedSkill::search: lowercase all terms, all terms
-// must appear in (namespace + name + description + tags) lowercase. The
-// namespace inclusion mirrors the live registry's search_text() so
-// `knack find anthropics` lists everything from that vendor without users
-// having to remember individual skill names.
+// Delegates to knack-search-wasm — a WASM build of knack-core's own
+// `RegistryIndex::search` — instead of reimplementing the
+// matching/ranking algorithm in JS. That reimplementation used to
+// live here and only ever did the AND-of-substrings filter, with no
+// scoring at all; results came back in whatever order index.json
+// happened to be in, and a broad query term (e.g. "deploy") that
+// merely appeared once in an unrelated skill's description was
+// indistinguishable from an actually-relevant match. Calling into
+// the real Rust algorithm means this worker can never drift out of
+// sync with `knack-registry serve`'s `/search` again, and gets every
+// improvement to the ranking model (including IDF-based down-
+// weighting of common terms) for free.
 //
 // The whole index is loaded per request — at our scale (a few hundred KB)
 // this is cheap, and Cloudflare's HTTP cache layer (set above via
 // cache-control) means most requests don't touch the Worker at all.
 async function handleSearch(env, query) {
-    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-    if (terms.length === 0) {
+    if (!query.trim()) {
         return jsonResponse([]);
     }
 
@@ -107,21 +117,21 @@ async function handleSearch(env, query) {
     if (!indexObj) {
         return new Response('index missing', { status: 500 });
     }
-    const index = await indexObj.json();
+    const indexJson = await indexObj.text();
 
-    const matches = (index.skill || []).filter((skill) => {
-        const haystack = [
-            skill.namespace || '',
-            skill.name,
-            skill.description,
-            (skill.tags || []).join(' '),
-        ]
-            .join(' ')
-            .toLowerCase();
-        return terms.every((term) => haystack.includes(term));
+    let resultsJson;
+    try {
+        resultsJson = wasmSearch(indexJson, query);
+    } catch (err) {
+        return new Response(`search failed: ${err}`, { status: 500 });
+    }
+
+    return new Response(resultsJson, {
+        headers: {
+            'content-type': 'application/json',
+            'cache-control': `public, max-age=${CACHE_TTL_SECONDS}`,
+        },
     });
-
-    return jsonResponse(matches);
 }
 
 // Namespaced archive: direct R2 lookup using the qualified key. Sets

@@ -60,6 +60,14 @@ complementary, not competing.
 
 ## One-time setup
 
+Prerequisites for building the Worker itself (not needed for the daily
+data-refresh workflow, only when `wrangler dev`/`wrangler deploy` runs):
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version <version>  # match knack-search-wasm/Cargo.toml's wasm-bindgen version
+```
+
 ```bash
 # 1. Install wrangler if you haven't.
 npm install -g wrangler
@@ -75,7 +83,10 @@ wrangler r2 bucket create knack-registry-public
 #    -> your Worker -> Settings -> Triggers -> Add Custom Domain.
 #    Or via wrangler.toml's [[routes]] block.
 
-# 5. Deploy the Worker.
+# 5. Deploy the Worker. wrangler.toml's [build] block runs build.sh
+#    first, which compiles knack-search-wasm to wasm32-unknown-unknown
+#    and generates the JS glue this worker imports (./pkg/) — see
+#    "Search implementation" below.
 wrangler deploy
 ```
 
@@ -185,6 +196,32 @@ knack find pdf
 knack add public:anthropics/pdf      # canonical
 knack add public:pdf                 # legacy bare, registry resolves
 ```
+
+## Search implementation
+
+`/search` doesn't reimplement knack's matching/ranking algorithm in
+JS. Instead, the `knack-search-wasm` crate (workspace member, not
+published to crates.io) compiles `knack-core::RegistryIndex::search`
+— the exact same code `knack-registry serve`'s `/search` endpoint
+calls — to `wasm32-unknown-unknown`, and `build.sh` generates the JS
+glue (`wasm-bindgen --target bundler`) this worker imports as
+`./pkg/knack_search_wasm.js`. `handleSearch` in `worker.js` fetches
+`index.json` from R2 and hands the raw JSON plus the query straight
+to the WASM `search` function, which returns ranked, scored results —
+same shape, same algorithm, same ranking as the live registry.
+
+This used to be a hand-written JS reimplementation that only
+filtered (AND-of-substrings across name/namespace/tags/description)
+without ever computing a relevance score, so results came back in
+whatever order `index.json` happened to be in. Sharing the real
+implementation instead of re-deriving it means this Worker picks up
+every future improvement to the ranking model (e.g. IDF-based
+down-weighting of common query terms) automatically, and can't drift
+out of sync with the live registry's behavior again.
+
+`./pkg/` is a build artifact (gitignored, like `/target`) — `build.sh`
+regenerates it from source on every `wrangler dev`/`wrangler deploy`
+via wrangler.toml's `[build]` block.
 
 ## What this Worker does NOT do
 

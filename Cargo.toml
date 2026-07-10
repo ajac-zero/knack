@@ -4,6 +4,7 @@ members = [
     "knack",
     "knack-registry",
     "knack-core",
+    "knack-search-wasm",
 ]
 
 [workspace.package]
