@@ -6,6 +6,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY knack-core ./knack-core
 COPY knack-registry ./knack-registry
 COPY knack ./knack
+COPY knack-search-wasm ./knack-search-wasm
 
 RUN cargo build --release -p knack-registry
 
@@ -22,4 +23,4 @@ WORKDIR /data
 EXPOSE 7349
 
 ENTRYPOINT ["knack-registry"]
-CMD ["--index", "/data/knack.index.toml", "--skills-root", "/data/skills", "--public-alias", "company", "--bind", "0.0.0.0:7349"]
+CMD ["--index", "/data/knack.index.toml", "--skills-root", "/data/skills", "--name", "company", "--bind", "0.0.0.0:7349"]
