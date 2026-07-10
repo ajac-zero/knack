@@ -107,6 +107,8 @@ That lets administrators inject aliases such as `tea:` for all users while still
 
 Read-only commands (`knack find`, `knack registry list`) search the merged set of registries from all three layers automatically. They work from a directory with no project manifest, so a globally-registered `company:` alias is reachable without an explicit `-g`.
 
+`knack find <query>` ranks results best-match-first: a hit in a skill's name or tags outranks one that only appears incidentally in its description, and each result shows its description so you can tell why it matched without installing it first. Output is capped at 10 matches by default — pass `--limit N` to see more. If one of your configured registries is unreachable, `find` warns and keeps going with the rest rather than failing the whole command.
+
 Add and install a skill source into the manifest target:
 
 ```bash
@@ -283,16 +285,34 @@ knack registry add http://127.0.0.1:7349 local
 knack find pdf
 ```
 
-Search results are installable sources:
+Each match renders as a compact card: a header that's simultaneously the skill's identity and the exact thing to paste after `knack add`, plus its description. The `knack add` prefix is spelled out once in the heading rather than repeated on every card — every card's header already is the rest of the command:
 
 ```text
-local	pdf	Work with PDF files...	gh:owner/repo/skills/pdf
+1 skill found — install with `knack add <name>`
+
+owner/pdf
+  Work with PDF files...
 ```
 
-In proxy mode, results look like this:
+In proxy mode, results look the same way:
 
 ```text
-company	deploy-container	Deploy containers to Kubernetes. 	company:deploy-container
+1 skill found — install with `knack add <name>`
+
+deploy-container
+  Deploy containers to Kubernetes.
+```
+
+With more than one registry configured, each header gains a `<registry>:` prefix so you can tell where a result came from and install it unambiguously — regardless of which registry happens to be your configured default, since the explicit `<registry>:<name>` form always resolves correctly:
+
+```text
+2 skills found — install with `knack add <name>`
+
+acme-internal:acme-platform-team/deploy-app
+  Deploy an app via Argo CD.
+
+public-mirror:acme-platform-team/release-pr
+  Mirror of release-pr on the public mirror.
 ```
 
 Users can install without knowing the backing Git repo:
