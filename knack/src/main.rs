@@ -170,6 +170,13 @@ enum Command {
         /// project manifest.
         #[arg(long)]
         manifest: Option<PathBuf>,
+
+        /// Maximum number of matches to display, ranked best-match
+        /// first. Registries may return many results for a broad
+        /// query; this caps output volume without losing the
+        /// highest-relevance hits.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
     },
 
     /// Publish a skill to a git-backed skill repository.
@@ -481,8 +488,16 @@ fn accent_style() -> Style {
     AnsiColor::Cyan.on_default() | Effects::BOLD
 }
 
+/// Dimmed, uncoloured — used for field labels ("registry:", "from",
+/// etc.) so they read as secondary/structural text rather than
+/// competing for attention with the actual values. Deliberately not
+/// tied to a specific ANSI colour: colour choices like blue read
+/// poorly on some terminal themes, and stacking a bold colour on
+/// every label next to a bold colour on every value (the previous
+/// blue-label/cyan-value pairing) made output feel like a wall of
+/// colour with no visual hierarchy.
 fn label_style() -> Style {
-    AnsiColor::Blue.on_default() | Effects::BOLD
+    Style::new().dimmed()
 }
 
 fn status(action: &str, value: impl fmt::Display) {
@@ -498,15 +513,70 @@ fn notice(message: &str) {
     anstream::println!("{message_style}{message}{message_style:#}");
 }
 
-fn label_value(label: &str, value: impl fmt::Display) {
-    let label_style = label_style();
-    let value_style = accent_style();
-    // Column width of 10 accommodates the longest label currently in
-    // use ("namespace:" added with namespacing). Shorter labels get
-    // trailing space padding so values align across rows.
-    anstream::println!(
-        "  {label_style}{label:<10}{label_style:#} {value_style}{value}{value_style:#}"
-    );
+fn warn_style() -> Style {
+    AnsiColor::Yellow.on_default() | Effects::BOLD
+}
+
+/// Prints a non-fatal warning to stderr (not stdout, so scripts piping
+/// `knack find`'s result lines aren't polluted). Used for degraded
+/// conditions the user should know about but that don't abort the
+/// command — e.g. one registry among several being unreachable.
+fn warn(message: &str) {
+    let message_style = warn_style();
+    anstream::eprintln!("{message_style}warning:{message_style:#} {message}");
+}
+
+/// Prints `text` word-wrapped to `width` columns, each line indented
+/// by `indent` spaces and with no label — used for free-form prose
+/// (a skill's description in `find`'s output) where a "label: value"
+/// row per field reads as a bulleted list rather than the compact
+/// name/description/command card `find` aims for. Real skill
+/// descriptions regularly run several sentences, which overflows the
+/// terminal mid-word if printed as a single unbroken line.
+fn print_wrapped(text: &str, width: usize, indent: usize) {
+    for line in wrap_text(text, width.saturating_sub(indent).max(20)) {
+        anstream::println!("{:indent$}{line}", "");
+    }
+}
+
+/// Greedy word-wrap: packs whitespace-separated words onto each line
+/// up to `width` columns. Doesn't attempt hyphenation or
+/// unicode-width awareness (a plain `.len()` byte count) — adequate
+/// for the mostly-ASCII skill descriptions this is used for, and
+/// avoids pulling in a wrapping crate for one call site.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.len() + 1 + word.len() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Best-effort terminal width for wrapping decisions. Honours
+/// `COLUMNS` when a shell exports it; otherwise falls back to a
+/// conservative 100-column default rather than pulling in a
+/// terminal-size detection crate for this one heuristic. Clamped to a
+/// sane minimum so a garbage/tiny `COLUMNS` value can't produce
+/// unreadable one-word-per-line output.
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&w| w > 0)
+        .unwrap_or(100)
+        .max(40)
 }
 
 fn main() -> Result<()> {
@@ -558,8 +628,12 @@ fn main() -> Result<()> {
             let manifest = resolve_manifest_path(manifest, scope)?;
             update_skills(&manifest, force, dry_run, &skills)?;
         }
-        Command::Find { query, manifest } => {
-            find_registry_skills(manifest.as_deref(), &query)?;
+        Command::Find {
+            query,
+            manifest,
+            limit,
+        } => {
+            find_registry_skills(manifest.as_deref(), &query, limit)?;
         }
         Command::Publish {
             path,
@@ -691,6 +765,7 @@ fn generate_index(root: &Path, source_prefix: &str, output: &Path) -> Result<()>
             description: skill.description,
             source: format!("{}/{}", source_prefix.trim_end_matches('/'), relative),
             tags: Vec::new(),
+            score: None,
         });
     }
     index
@@ -837,7 +912,21 @@ fn validate_registry_name(name: &str) -> Result<()> {
     validate_skill_name(name).context("registry aliases use the same naming rules as skills")
 }
 
-fn find_registry_skills(explicit_manifest: Option<&Path>, query: &str) -> Result<()> {
+/// One skill match aggregated across registries, ready for ranking
+/// and display. `score` comes from the registry's `/search` response
+/// (see `RegistryIndex::search` in knack-core); `None` only when
+/// talking to a registry that hasn't been upgraded to send it, in
+/// which case the match sorts after every scored match instead of
+/// crashing or defaulting to first place.
+struct FindMatch {
+    skill_name: String,
+    namespace: Option<String>,
+    description: String,
+    registry_name: String,
+    score: Option<f64>,
+}
+
+fn find_registry_skills(explicit_manifest: Option<&Path>, query: &str, limit: usize) -> Result<()> {
     let query = query.trim();
     if query.is_empty() {
         bail!("find query must not be empty");
@@ -845,72 +934,176 @@ fn find_registry_skills(explicit_manifest: Option<&Path>, query: &str) -> Result
 
     let (manifest, manifest_path) = read_manifest_for_read(explicit_manifest)?;
     let registries = effective_registries(&manifest, &manifest_path)?;
-    // When the match's registry equals the effective default we can
-    // suggest the short bare form (`knack add anthropics/pdf`) — a
-    // teaching-by-example nudge toward the more ergonomic syntax.
-    // For any other registry we keep the fully-qualified form so the
-    // command works regardless of the user's default config.
-    let default_registry = effective_default_registry(&manifest, &manifest_path, &registries)?;
+    // The registry a match came from is only worth displaying when
+    // there's more than one candidate it could have come from — with
+    // a single configured registry it's the same value on every
+    // single card, which is pure redundancy rather than information.
+    // When it IS shown, it's shown unconditionally (not just for
+    // non-default registries): the explicit `<registry>:<name>` form
+    // always works regardless of which registry happens to be the
+    // configured default (see resolve_source_alias's alias:rest
+    // branch), so once a card shows both the qualified name and its
+    // registry, the exact install command is always inferable as
+    // `<registry>:<qualified>` — no separate install line needed. A
+    // single configured registry needs no prefix at all; the bare
+    // qualified name shown in the header is already the exact command.
+    let show_registry = registries
+        .values()
+        .filter(|registry| matches!(registry.kind, RegistryKind::Http))
+        .count()
+        > 1;
     let mut matches = Vec::new();
+    // Two registries can surface the literal same (registry, skill)
+    // pair (e.g. a registry's index listing an entry twice). Dedup on
+    // that pair — the closest thing to "this is the same suggestion
+    // twice" now that there's no separate formatted install string.
+    let mut seen = std::collections::HashSet::new();
+    let mut failed_registries = Vec::new();
 
     for (name, registry) in &registries {
         if !matches!(registry.kind, RegistryKind::Http) {
             continue;
         }
 
-        let results = search_http_registry(&registry.url, query)
-            .with_context(|| format!("failed to search registry {name}"))?;
+        // A single unreachable registry shouldn't blank out results
+        // from every other configured registry — warn and keep going
+        // rather than aborting the whole command.
+        let results = match search_http_registry(&registry.url, query) {
+            Ok(results) => results,
+            Err(err) => {
+                warn(&format!("registry {name} unavailable: {err:#}"));
+                failed_registries.push(name.clone());
+                continue;
+            }
+        };
         for skill in results {
-            // qualified_name() returns "<namespace>/<name>" when the
-            // registry attributed the skill to a namespace, bare
-            // "<name>" otherwise. The registry's /search endpoint
-            // already rewrites skill.source to this exact form, but
-            // we recompute defensively in case the registry response
-            // isn't rewriting (e.g. operator forgot --name on the
-            // server, or a non-knack registry compatible at the
-            // protocol level but not at the rewrite layer).
             let qualified = skill.qualified_name();
-            let source = if default_registry.as_deref() == Some(name.as_str()) {
-                // Bare form (no registry prefix) — resolves through
-                // default_registry on install.
-                qualified.clone()
-            } else {
-                format!("{name}:{qualified}")
-            };
-            matches.push((skill.name, skill.namespace, name.clone(), source));
+            if !seen.insert((name.clone(), qualified)) {
+                continue;
+            }
+            matches.push(FindMatch {
+                skill_name: skill.name,
+                namespace: skill.namespace,
+                description: skill.description,
+                registry_name: name.clone(),
+                score: skill.score,
+            });
         }
     }
 
     if matches.is_empty() {
         notice("no matching skills found");
+        if !failed_registries.is_empty() {
+            warn(&format!(
+                "registries unreachable: {}",
+                failed_registries.join(", ")
+            ));
+        }
         return Ok(());
     }
 
-    let heading_style = label_style();
+    // Rank best-match-first. Registries already return their own
+    // results pre-sorted by score, but results from multiple
+    // registries need a global re-sort on the merged set. Unscored
+    // matches (older registry) sort after every scored match rather
+    // than defaulting to 0.0, which would otherwise rank them above
+    // any negative... there are no negative scores today, but this
+    // keeps "unscored" visibly distinct from "scored zero" if that
+    // ever changes. Ties break alphabetically by skill name for
+    // stable, predictable output.
+    matches.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.skill_name.cmp(&b.skill_name))
+    });
+
+    let total = matches.len();
+    matches.truncate(limit);
+
     let count_style = accent_style();
+    let label_style_hint = label_style();
+    // "knack add" is spelled out once here rather than repeated on
+    // every card — every card's header IS the exact thing to paste
+    // after it, so there's nothing left to repeat per card.
     anstream::println!(
-        "{heading_style}found{heading_style:#} {count_style}{}{count_style:#} skill{}:",
-        matches.len(),
-        if matches.len() == 1 { "" } else { "s" }
+        "{count_style}{}{count_style:#} skill{} found {label_style_hint}— install with `knack add <name>`{label_style_hint:#}\n",
+        total,
+        if total == 1 { "" } else { "s" }
     );
-    for (skill_name, namespace, registry_name, source) in matches {
-        let skill_style = accent_style();
-        anstream::println!("\n{skill_style}{skill_name}{skill_style:#}");
-        // Namespace surfaces under the skill name so users see who
-        // attributed the skill (the vendor scope) before they pick
-        // one to install. Omitted when None — the registry doesn't
-        // namespace the entry, so we don't show a stale empty field.
-        if let Some(ns) = namespace {
-            label_value("namespace:", ns);
+    let wrap_width = terminal_width();
+    // Each match renders as a compact two-line card — header
+    // (identity, and simultaneously the exact install command),
+    // description (why it matched) — with no per-field labels and no
+    // blank line inside a card, only between cards. The original
+    // layout gave every field ("namespace:", "description:",
+    // "registry:", "install:") its own labelled row, which read as a
+    // nested bulleted list; a later pass collapsed that to a header
+    // plus a separate install line, but the header already contains
+    // everything (qualified name, and registry when it's not the
+    // sole one configured) needed to construct the install command,
+    // making a separate line pure repetition. `<registry>:<name>`
+    // always resolves correctly regardless of which registry happens
+    // to be the configured default (resolve_source_alias's
+    // `alias:rest` branch doesn't consult the default at all), so
+    // there's no correctness reason to special-case the default
+    // registry's entries either — every card's header is exactly the
+    // command to paste after `knack add`.
+    for (
+        i,
+        FindMatch {
+            skill_name,
+            namespace,
+            description,
+            registry_name,
+            score: _,
+        },
+    ) in matches.into_iter().enumerate()
+    {
+        if i > 0 {
+            anstream::println!();
         }
-        label_value("registry:", registry_name);
-        let label_style = label_style();
-        let source_style = accent_style();
-        anstream::println!(
-            "  {label_style}{:<10}{label_style:#} knack add {source_style}{}{source_style:#}",
-            "install:",
-            source
-        );
+        // Namespace folds into the header instead of its own row —
+        // "<namespace>/<name>" is exactly the form users type to
+        // install, so showing it there does double duty as both
+        // attribution and a preview of the install source's shape.
+        let qualified = match &namespace {
+            Some(ns) => format!("{ns}/{skill_name}"),
+            None => skill_name,
+        };
+        let skill_style = accent_style();
+        if show_registry {
+            // Registry prefix dimmed, qualified name accented — the
+            // registry is necessary information (which server this
+            // came from) but the skill itself is what the reader
+            // actually cares about distinguishing card-to-card, so it
+            // gets the stronger accent while the prefix stays
+            // secondary/structural, same as every other dimmed label.
+            let label_style = label_style();
+            anstream::println!(
+                "{label_style}{registry_name}:{label_style:#}{skill_style}{qualified}{skill_style:#}"
+            );
+        } else {
+            anstream::println!("{skill_style}{qualified}{skill_style:#}");
+        }
+        // Wrapped, unlabelled: skill descriptions are written for an
+        // LLM's benefit and often run to several sentences, which
+        // overflows most terminals mid-word if left unwrapped. No
+        // label needed — it's the only paragraph in the card.
+        print_wrapped(&description, wrap_width, 2);
+    }
+
+    if total > limit {
+        anstream::println!();
+        notice(&format!(
+            "showing {limit} of {total} matches — pass --limit N to see more"
+        ));
+    }
+    if !failed_registries.is_empty() {
+        warn(&format!(
+            "registries unreachable: {}",
+            failed_registries.join(", ")
+        ));
     }
 
     Ok(())
