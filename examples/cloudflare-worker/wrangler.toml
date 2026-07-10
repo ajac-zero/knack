@@ -2,6 +2,13 @@ name = "knack-registry-public"
 main = "worker.js"
 compatibility_date = "2025-01-01"
 
+# Regenerates ./pkg (the WASM search binding) before every `wrangler
+# dev` / `wrangler deploy`, so the worker always ships the search
+# algorithm from the knack-search-wasm crate currently on disk rather
+# than a stale build. See build.sh for prerequisites.
+[build]
+command = "./build.sh"
+
 # Bind the R2 bucket where the static snapshot lives. After running
 # `knack-registry build-static --output ./dist`, upload ./dist's
 # contents into this bucket (preserving the `skills/` subdirectory).
