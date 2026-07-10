@@ -371,6 +371,16 @@ pub struct IndexedSkill {
 
     #[serde(default)]
     pub tags: Vec<String>,
+
+    /// Relevance score assigned by `RegistryIndex::search`. Only ever
+    /// set on results returned from a search — never persisted in
+    /// `knack.index.toml` and never present on entries read from
+    /// `/index`, so this is skipped on serialization whenever `None`.
+    /// Kept `#[serde(default)]` on the way in so index files written
+    /// before this field existed (and any registry that hasn't
+    /// upgraded yet) still deserialize cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -403,7 +413,17 @@ impl RegistryIndex {
         Ok(())
     }
 
-    pub fn search(&self, query: &str) -> Vec<&IndexedSkill> {
+    /// Scores and ranks skills against a whitespace-separated query.
+    /// Every term must match *somewhere* in a skill (name, namespace,
+    /// description, or tags) for the skill to be included at all —
+    /// same AND semantics as before. What's new is *where* a term
+    /// matched now affects ranking: a hit in the name or tags counts
+    /// for much more than a hit buried in the description, so a
+    /// query term that merely appears in unrelated prose no longer
+    /// ranks a skill as highly as one that's actually about that
+    /// term. Results are sorted best-match-first (ties broken
+    /// alphabetically by `qualified_name()` for stable output).
+    pub fn search(&self, query: &str) -> Vec<(&IndexedSkill, f64)> {
         let terms: Vec<String> = query
             .split_whitespace()
             .map(|term| term.to_ascii_lowercase())
@@ -412,13 +432,19 @@ impl RegistryIndex {
             return Vec::new();
         }
 
-        self.skill
+        let mut scored: Vec<(&IndexedSkill, f64)> = self
+            .skill
             .iter()
-            .filter(|skill| {
-                let haystack = skill.search_text();
-                terms.iter().all(|term| haystack.contains(term))
-            })
-            .collect()
+            .filter_map(|skill| skill.match_score(&terms).map(|score| (skill, score)))
+            .collect();
+
+        scored.sort_by(|(a, a_score), (b, b_score)| {
+            b_score
+                .partial_cmp(a_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.qualified_name().cmp(&b.qualified_name()))
+        });
+        scored
     }
 }
 
@@ -460,17 +486,95 @@ impl IndexedSkill {
         }
     }
 
-    fn search_text(&self) -> String {
-        let ns = self.namespace.as_deref().unwrap_or("");
-        format!(
-            "{} {} {} {}",
-            ns,
-            self.name,
-            self.description,
-            self.tags.join(" ")
-        )
-        .to_ascii_lowercase()
+    /// Scores a single already-lowercased term against one field,
+    /// choosing the highest tier the term qualifies for in that
+    /// field. `is_name_or_tag` widens the "whole word" and "starts
+    /// with" tiers to also apply to tags/namespace, since those are
+    /// short identifier-like strings where a whole-word hit is just
+    /// as meaningful as an exact name match, unlike the free-form
+    /// description field.
+    fn field_weight(term: &str, field: &str, is_name_or_tag: bool) -> f64 {
+        if field.is_empty() {
+            return 0.0;
+        }
+        if is_name_or_tag {
+            if field == term {
+                return 4.0;
+            }
+            if field.starts_with(term) {
+                return 3.0;
+            }
+            if word_boundary_match(field, term) {
+                return 2.0;
+            }
+        }
+        if field.contains(term) {
+            if is_name_or_tag { 1.0 } else { 0.5 }
+        } else {
+            0.0
+        }
     }
+
+    /// Sums, per term, the best weight found across name/namespace/
+    /// tags/description. Returns `None` if any term matched nowhere
+    /// (preserving the previous AND-of-substrings filtering
+    /// behaviour), `Some(total_score)` otherwise.
+    fn match_score(&self, terms: &[String]) -> Option<f64> {
+        let name = self.name.to_ascii_lowercase();
+        let namespace = self
+            .namespace
+            .as_deref()
+            .map(|ns| ns.to_ascii_lowercase())
+            .unwrap_or_default();
+        let description = self.description.to_ascii_lowercase();
+        let tags: Vec<String> = self.tags.iter().map(|t| t.to_ascii_lowercase()).collect();
+
+        let mut total = 0.0;
+        for term in terms {
+            let mut best = Self::field_weight(term, &name, true);
+            best = best.max(Self::field_weight(term, &namespace, true));
+            for tag in &tags {
+                best = best.max(Self::field_weight(term, tag, true));
+            }
+            best = best.max(Self::field_weight(term, &description, false));
+
+            if best <= 0.0 {
+                return None;
+            }
+            total += best;
+        }
+        Some(total)
+    }
+}
+
+/// True if `term` appears in `field` as a whole word — surrounded by
+/// non-alphanumeric boundaries (or the string edges). Used to rank a
+/// standalone-word hit above a mid-word substring hit (e.g. "pdf" in
+/// tag "pdf" vs. tag "pdf-export") without requiring an exact match.
+fn word_boundary_match(field: &str, term: &str) -> bool {
+    let mut start = 0;
+    while let Some(idx) = field[start..].find(term) {
+        let match_start = start + idx;
+        let match_end = match_start + term.len();
+        let before_ok = match_start == 0
+            || !field[..match_start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric());
+        let after_ok = match_end == field.len()
+            || !field[match_end..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        start = match_start + 1;
+        if start >= field.len() {
+            break;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -581,6 +685,7 @@ mod tests {
                     description: "Work with PDF documents".to_string(),
                     source: "anthropics/pdf".to_string(),
                     tags: vec!["documents".to_string(), "ocr".to_string()],
+                    score: None,
                 },
                 IndexedSkill {
                     name: "rust-code-review".to_string(),
@@ -588,6 +693,7 @@ mod tests {
                     description: "Review Rust code".to_string(),
                     source: "rust-code-review".to_string(),
                     tags: vec!["rust".to_string()],
+                    score: None,
                 },
             ],
             source: Vec::new(),
@@ -602,6 +708,91 @@ mod tests {
     }
 
     #[test]
+    fn ranks_name_matches_above_description_only_matches() {
+        // Both skills mention "rust" somewhere, but only one is
+        // actually named/tagged for it. The name/tag hit must
+        // outrank the incidental description mention so a query for
+        // "rust" doesn't bury the relevant skill under unrelated
+        // results that merely reference it in passing.
+        let index = RegistryIndex {
+            skill: vec![
+                IndexedSkill {
+                    name: "changelog-writer".to_string(),
+                    namespace: None,
+                    description: "Summarize commits, including ones touching Rust code."
+                        .to_string(),
+                    source: "changelog-writer".to_string(),
+                    tags: vec![],
+                    score: None,
+                },
+                IndexedSkill {
+                    name: "rust-code-review".to_string(),
+                    namespace: None,
+                    description: "Review code for correctness".to_string(),
+                    source: "rust-code-review".to_string(),
+                    tags: vec!["rust".to_string()],
+                    score: None,
+                },
+            ],
+            source: Vec::new(),
+        };
+
+        let results = index.search("rust");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0.name, "rust-code-review");
+        assert!(results[0].1 > results[1].1);
+    }
+
+    #[test]
+    fn requires_every_term_to_match_somewhere() {
+        // AND semantics preserved: a skill matching only one of two
+        // terms must be excluded entirely, not merely ranked lower.
+        let index = RegistryIndex {
+            skill: vec![IndexedSkill {
+                name: "pdf".to_string(),
+                namespace: Some("anthropics".to_string()),
+                description: "Work with PDF documents".to_string(),
+                source: "anthropics/pdf".to_string(),
+                tags: vec!["documents".to_string()],
+                score: None,
+            }],
+            source: Vec::new(),
+        };
+
+        assert_eq!(index.search("pdf python").len(), 0);
+        assert_eq!(index.search("pdf documents").len(), 1);
+    }
+
+    #[test]
+    fn ties_break_alphabetically_by_qualified_name() {
+        let index = RegistryIndex {
+            skill: vec![
+                IndexedSkill {
+                    name: "zeta".to_string(),
+                    namespace: None,
+                    description: "docs helper".to_string(),
+                    source: "zeta".to_string(),
+                    tags: vec![],
+                    score: None,
+                },
+                IndexedSkill {
+                    name: "alpha".to_string(),
+                    namespace: None,
+                    description: "docs helper".to_string(),
+                    source: "alpha".to_string(),
+                    tags: vec![],
+                    score: None,
+                },
+            ],
+            source: Vec::new(),
+        };
+
+        let results = index.search("docs");
+        assert_eq!(results[0].0.name, "alpha");
+        assert_eq!(results[1].0.name, "zeta");
+    }
+
+    #[test]
     fn qualified_name_round_trips() {
         let scoped = IndexedSkill {
             name: "pdf".to_string(),
@@ -609,6 +800,7 @@ mod tests {
             description: "x".to_string(),
             source: "anthropics/pdf".to_string(),
             tags: vec![],
+            score: None,
         };
         assert_eq!(scoped.qualified_name(), "anthropics/pdf");
 
@@ -618,6 +810,7 @@ mod tests {
             description: "x".to_string(),
             source: "legacy".to_string(),
             tags: vec![],
+            score: None,
         };
         assert_eq!(unscoped.qualified_name(), "legacy");
     }
@@ -631,6 +824,7 @@ mod tests {
             description: "x".to_string(),
             source: "good-ns/ok".to_string(),
             tags: vec![],
+            score: None,
         };
         assert!(skill.validate().is_ok());
 
@@ -738,6 +932,7 @@ checksum = "x"
             description: "x".to_string(),
             source: "legacy".to_string(),
             tags: vec![],
+            score: None,
         };
         let json = serde_json::to_string(&skill).unwrap();
         assert!(
