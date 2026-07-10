@@ -698,6 +698,7 @@ async fn refresh_index_and_cache(
                 description: skill.description,
                 source: skill_source,
                 tags: source.tags.clone(),
+                score: None,
             });
         }
     }
@@ -790,8 +791,21 @@ async fn search(
     Query(params): Query<SearchParams>,
 ) -> Json<Vec<IndexedSkill>> {
     let guard = state.state.read().await;
-    let mut results: Vec<IndexedSkill> =
-        guard.index.search(&params.q).into_iter().cloned().collect();
+    // search() already returns results ranked best-match-first (see
+    // RegistryIndex::search); we just attach each result's score onto
+    // the cloned IndexedSkill so it survives the JSON round-trip to
+    // the client, which merges results across multiple registries and
+    // needs the score to re-rank the merged set.
+    let mut results: Vec<IndexedSkill> = guard
+        .index
+        .search(&params.q)
+        .into_iter()
+        .map(|(skill, score)| {
+            let mut skill = skill.clone();
+            skill.score = Some(score);
+            skill
+        })
+        .collect();
     drop(guard);
     if let Some(name) = &state.name {
         // Rewrite to the install-command form the user can paste:
