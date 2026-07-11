@@ -157,6 +157,18 @@ Validate a skill:
 knack validate rust-code-review
 ```
 
+Preview a skill before installing it. `inspect` resolves local paths,
+archives, Git sources, and configured registry aliases without modifying the
+manifest, lockfile, or install directory:
+
+```bash
+knack inspect public:anthropics/pdf
+knack inspect gh:anthropics/skills/skills/pdf
+```
+
+The preview shows the skill metadata, resolved source and commit when
+available, deterministic checksum, and included files.
+
 Package a skill:
 
 ```bash
@@ -427,6 +439,7 @@ Implemented:
 - System scoped config at `/etc/knack/knack.toml`.
 - Layered registry alias inheritance from system to global to project.
 - `add`, `sync`, and `update` workflows for reproducible project installs.
+- Read-only skill inspection before installation.
 - Content-addressed lockfile entries (commit SHA captured for `gh:`,
   `git+`, and `http+knack:` sources).
 - `knack sync --check` for CI: assert install + lockfile consistency.

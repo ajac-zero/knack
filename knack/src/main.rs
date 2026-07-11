@@ -179,6 +179,16 @@ enum Command {
         limit: usize,
     },
 
+    /// Preview a skill's metadata and contents without installing it.
+    Inspect {
+        /// Path, archive, gh: source, or configured registry source to inspect.
+        source: String,
+
+        /// Path to the project manifest used to resolve registry aliases.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
+
     /// Publish a skill to a git-backed skill repository.
     Publish {
         /// Path to the skill directory to publish.
@@ -634,6 +644,9 @@ fn main() -> Result<()> {
             limit,
         } => {
             find_registry_skills(manifest.as_deref(), &query, limit)?;
+        }
+        Command::Inspect { source, manifest } => {
+            inspect_skill_source(&source, manifest.as_deref())?;
         }
         Command::Publish {
             path,
@@ -1107,6 +1120,86 @@ fn find_registry_skills(explicit_manifest: Option<&Path>, query: &str, limit: us
     }
 
     Ok(())
+}
+
+struct SkillInspection {
+    name: String,
+    description: String,
+    source: String,
+    resolved_source: String,
+    resolved_sha: Option<String>,
+    namespace: Option<String>,
+    checksum: String,
+    files: Vec<String>,
+}
+
+/// Resolve and stage a skill in a temporary target so inspection exercises
+/// the same source, archive, and validation paths as installation while never
+/// modifying the user's manifest, lockfile, or configured install directory.
+fn inspect_skill_source(source: &str, explicit_manifest: Option<&Path>) -> Result<()> {
+    let (manifest, manifest_path) = read_manifest_for_read(explicit_manifest)?;
+    let resolved_source = resolve_source_alias(source, &manifest, &manifest_path)?;
+    let temp_dir =
+        tempfile::tempdir().context("failed to create temporary inspection directory")?;
+    let installed = install_skill(&resolved_source, &temp_dir.path().to_path_buf())?;
+    let skill = read_skill(&installed.path)?;
+    let files = collect_files(&installed.path)?
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(&installed.path)
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .with_context(|| {
+                    format!(
+                        "failed to make {} relative to {}",
+                        path.display(),
+                        installed.path.display()
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let inspection = SkillInspection {
+        name: skill.name,
+        description: skill.description,
+        source: source.to_string(),
+        resolved_source,
+        resolved_sha: installed.resolved_sha,
+        namespace: installed.namespace,
+        checksum: checksum_dir(&installed.path)?,
+        files,
+    };
+    print_skill_inspection(&inspection);
+    Ok(())
+}
+
+fn print_skill_inspection(inspection: &SkillInspection) {
+    let name_style = accent_style();
+    let label_style = label_style();
+    anstream::println!("{name_style}{}{name_style:#}", inspection.name);
+    anstream::println!(
+        "{label_style}description:{label_style:#} {}",
+        inspection.description
+    );
+    anstream::println!("{label_style}source:{label_style:#} {}", inspection.source);
+    if inspection.resolved_source != inspection.source {
+        anstream::println!(
+            "{label_style}resolved:{label_style:#} {}",
+            inspection.resolved_source
+        );
+    }
+    if let Some(namespace) = &inspection.namespace {
+        anstream::println!("{label_style}namespace:{label_style:#} {namespace}");
+    }
+    if let Some(sha) = &inspection.resolved_sha {
+        anstream::println!("{label_style}commit:{label_style:#} {sha}");
+    }
+    anstream::println!(
+        "{label_style}checksum:{label_style:#} {}",
+        inspection.checksum
+    );
+    anstream::println!("{label_style}files:{label_style:#}");
+    for file in &inspection.files {
+        anstream::println!("  {file}");
+    }
 }
 
 fn publish_skill(
