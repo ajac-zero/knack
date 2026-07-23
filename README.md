@@ -347,6 +347,31 @@ Dynamic sources must refresh successfully on startup before the registry serves 
 
 Pass `--cache-dir <path>` to keep the cloned backing repos across restarts. When set, refreshes do `git fetch + git reset --hard` against the existing clone instead of re-cloning, and archive requests read straight from the cache directory — no per-request git operations. Point it at a persistent volume (Fly.io Volume, EFS mount, GCP Cloud Run volume, anything that survives container restart) for the full benefit. When omitted, the registry uses a per-process tempdir that's rebuilt on every cold start — that's the right shape for ephemeral-filesystem platforms like Cloudflare Containers.
 
+### Direct publishing (live registry only)
+
+A live registry can also accept skills published directly over HTTP — no backing git repository required. Opt in with a data directory and at least one publish token:
+
+```bash
+knack-registry \
+  --index knack.index.toml \
+  --name company \
+  --data-dir /var/lib/knack \
+  --publish-token "$TOKEN" \
+  --bind 127.0.0.1:7349
+```
+
+This enables `PUT /skills/{namespace}/{name}`, authenticated with `Authorization: Bearer <token>`, accepting the exact tarball `knack pack` produces. Uploaded skills are stored under `<data-dir>/skills/<namespace>/<name>/`, folded into the index immediately, and re-indexed from disk on every refresh and restart — put `--data-dir` on a persistent volume. Unlike `--cache-dir` (rebuildable scratch), the data directory holds canonical data.
+
+Notes:
+
+- Publishing stays disabled unless **both** `--data-dir` and a token are configured; without them the server is read-only, the same surface a static snapshot offers.
+- `--publish-token` is repeatable (one per team, or old+new during rotation); `--publish-tokens-file` reads one token per line for setups where the process list is visible.
+- Uploads must be namespaced. A publish that would shadow a skill provided by a git-backed `[[skill]]`/`[[source]]` entry is rejected with 409 — the operator-managed index always wins.
+- Re-publishing the same `namespace/name` replaces the previous upload (latest-only; no version history yet).
+- Uploaded archives have no git provenance, so there's no `X-Knack-Resolved-Sha`; clients fall back to checksum-based change detection in the lockfile.
+- `GET /info` advertises `"publish": true|false` so clients can fail fast against read-only registries.
+- `--publish-max-bytes` caps the accepted archive size (default 50 MiB).
+
 ### Static deployment (Cloudflare R2 + Worker)
 
 For a public, read-mostly registry, the cheapest shape is to skip running a live registry process entirely. Run `knack-registry build-static` from a CI cron job, upload the output to an object store (R2, S3, GCS, anything), and serve it via a small edge worker:
@@ -360,7 +385,7 @@ knack-registry build-static \
 
 This produces `info.json`, `index.json`, `sha-map.json`, and one `skills/<name>.skill.tar.gz` per indexed skill. The output is everything a knack CLI client needs; an edge function in front of the bucket maps the four CLI endpoints (`/info`, `/index`, `/search`, `/skills/<name>/archive`) onto these files. See [`examples/cloudflare-worker/`](examples/cloudflare-worker/) for a working Worker + R2 setup with a daily GitHub Actions cron, free-tier-friendly at the scale of the public registry (~200 skills, single-digit thousands of requests/day).
 
-Tradeoff: refresh granularity drops from `--refresh-interval-seconds` (default 300s) to whatever your cron interval is (daily for the public registry). Static loses dynamic queries, auth, and the ability to index private sources — keep `knack-registry serve` for internal team registries where any of those matter.
+Tradeoff: refresh granularity drops from `--refresh-interval-seconds` (default 300s) to whatever your cron interval is (daily for the public registry). Static loses dynamic queries, auth, direct publishing (`knack publish` to an HTTP registry needs the live server's `PUT` endpoint), and the ability to index private sources — keep `knack-registry serve` for internal team registries where any of those matter.
 
 Static entries are still supported for hand-curated overrides:
 
@@ -393,7 +418,9 @@ knack add company:deploy-container
 
 `gh:` sources resolve directly against github.com and need no `--source-alias`. The curated source list used by the project's public registry instance lives at [`registries/public.toml`](registries/public.toml) — mirror it for your own registry, or open a PR with a new `[[source]]` entry to propose adding a source to the public one. The file's header documents the curation criteria and PR process.
 
-Publish a local skill into a git-backed team skills repository:
+Publish a local skill. Two flows, picked implicitly by the kind of registry you pass to `--registry`:
+
+**Git-host registries** — the skill lands as a commit in a skills repository:
 
 ```bash
 knack registry add git+ssh://git@gitea.example.com tea
@@ -402,14 +429,23 @@ knack publish ./my-skill \
   --repo platform/agent-skills
 ```
 
-Publishing currently supports `git-host` registries. It clones the target repository, copies the skill into `skills/<skill-name>`, regenerates `knack.index.toml`, commits the change, and pushes it. Use `--no-push` to leave the commit local in the temporary checkout for debugging.
-
-After the registry server is serving the updated `knack.index.toml`, teammates can discover and install the skill:
+This clones the target repository, copies the skill into `skills/<skill-name>`, regenerates `knack.index.toml`, commits the change, and pushes it. Use `--no-push` to leave the commit local in the temporary checkout for debugging. After the registry server is serving the updated `knack.index.toml`, teammates can discover and install the skill:
 
 ```bash
 knack find my-skill
 knack add tea:platform/agent-skills/skills/my-skill
 ```
+
+**HTTP registries** — the skill is uploaded straight to a live `knack-registry` with publishing enabled (see [Direct publishing](#direct-publishing-live-registry-only)), no git repository involved:
+
+```bash
+knack publish ./my-skill \
+  --registry company \
+  --namespace platform-team \
+  --token "$TOKEN"          # or set KNACK_PUBLISH_TOKEN
+```
+
+The skill is packed, validated, and uploaded; teammates install it as `knack add company:platform-team/my-skill` immediately. Static registry snapshots and registries started without `--data-dir`/`--publish-token` reject publishes with an actionable error.
 
 List installed skills:
 
@@ -433,6 +469,8 @@ Implemented:
 - Registry-side proxying from indexed Git backing sources.
 - Registry index generation from local skill directories.
 - Publishing skills to git-backed team repositories.
+- Direct HTTP publishing to a live registry (`knack publish` →
+  `PUT /skills/{ns}/{name}`, token-authenticated, filesystem-backed).
 - Project manifests with `knack.toml`.
 - Lockfiles with `knack.lock`.
 - Project and global scoped config/install paths.

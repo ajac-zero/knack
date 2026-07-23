@@ -38,12 +38,10 @@ const HELP_STYLES: Styles = Styles::styled()
 const PUBLIC_REGISTRY_NAME: &str = "public";
 const PUBLIC_REGISTRY_URL: &str = "https://knack.ajac-zero.com";
 
-use flate2::{Compression, write::GzEncoder};
 use knack_core::{
     IndexedSkill, LockedSkill, Lockfile, Manifest, RegistryConfig, RegistryIndex, RegistryKind,
     checksum_dir, collect_files, read_skill, validate_skill, validate_skill_name,
 };
-use tar::{Builder, Header};
 use tempfile::TempDir;
 
 #[derive(Debug, Parser)]
@@ -189,22 +187,44 @@ enum Command {
         manifest: Option<PathBuf>,
     },
 
-    /// Publish a skill to a git-backed skill repository.
+    /// Publish a skill to a registry.
+    ///
+    /// Git-host registries receive the skill as a commit pushed to a
+    /// skills repository (pass --repo). HTTP registries receive it as
+    /// a direct upload to the registry's publish endpoint (pass
+    /// --namespace and authenticate with --token or
+    /// KNACK_PUBLISH_TOKEN) — no git repository involved. Static
+    /// registry snapshots cannot accept publishes.
     Publish {
         /// Path to the skill directory to publish.
         path: PathBuf,
 
-        /// Git-host registry alias to publish through.
+        /// Registry alias to publish through.
         #[arg(long)]
         registry: String,
 
         /// Repository in owner/repo form under the registry host.
+        /// Required for git-host registries; not applicable to HTTP
+        /// registries.
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
 
-        /// Directory inside the repository where skills live.
-        #[arg(long, default_value = "skills")]
-        skills_dir: PathBuf,
+        /// Directory inside the repository where skills live. Only
+        /// applies to git-host registries. Defaults to `skills`.
+        #[arg(long)]
+        skills_dir: Option<PathBuf>,
+
+        /// Vendor scope to publish under on an HTTP registry (the
+        /// skill installs as `<registry>:<namespace>/<name>`). Only
+        /// applies to HTTP registries.
+        #[arg(long)]
+        namespace: Option<String>,
+
+        /// Publish token for an HTTP registry. Falls back to the
+        /// KNACK_PUBLISH_TOKEN environment variable — prefer the env
+        /// var where your shell history or process list is shared.
+        #[arg(long)]
+        token: Option<String>,
 
         /// Path to the project manifest.
         #[arg(long)]
@@ -214,9 +234,10 @@ enum Command {
         #[arg(short = 'g', long)]
         global: bool,
 
-        /// Do not push the generated commit. The clone is preserved on
-        /// disk and its path is printed so you can inspect the result
-        /// and push manually when ready.
+        /// Do not push the generated commit (git-host registries
+        /// only). The clone is preserved on disk and its path is
+        /// printed so you can inspect the result and push manually
+        /// when ready.
         #[arg(long)]
         no_push: bool,
     },
@@ -653,13 +674,22 @@ fn main() -> Result<()> {
             registry,
             repo,
             skills_dir,
+            namespace,
+            token,
             manifest,
             global,
             no_push,
         } => {
             let scope = Scope::from_global_flag(global);
             let manifest = resolve_manifest_path(manifest, scope)?;
-            publish_skill(&manifest, &path, &registry, &repo, &skills_dir, no_push)?;
+            let options = PublishOptions {
+                repo,
+                skills_dir,
+                namespace,
+                token,
+                no_push,
+            };
+            publish_skill(&manifest, &path, &registry, options)?;
         }
         Command::Registry { command } => {
             handle_registry_command(command)?;
@@ -1202,13 +1232,23 @@ fn print_skill_inspection(inspection: &SkillInspection) {
     }
 }
 
+/// CLI-facing options for `knack publish`, split by registry kind at
+/// dispatch: `repo`/`skills_dir`/`no_push` drive the git-host flow,
+/// `namespace`/`token` drive the HTTP upload flow. Kept as one struct
+/// because the user picks the flow implicitly via --registry.
+struct PublishOptions {
+    repo: Option<String>,
+    skills_dir: Option<PathBuf>,
+    namespace: Option<String>,
+    token: Option<String>,
+    no_push: bool,
+}
+
 fn publish_skill(
     manifest_path: &Path,
     skill_path: &Path,
     registry_name: &str,
-    repo: &str,
-    skills_dir: &Path,
-    no_push: bool,
+    options: PublishOptions,
 ) -> Result<()> {
     let skill = read_skill(skill_path)?;
     validate_skill(&skill)?;
@@ -1223,14 +1263,35 @@ fn publish_skill(
         ),
     };
     match registry.kind {
-        RegistryKind::GitHost => {}
-        RegistryKind::Http => bail!(
-            "registry `{registry_name}` is configured as `http`, but \
-             `knack publish` only supports git-host registries; register \
-             a git-host registry with `knack registry add git+ssh://... <name>` \
-             and pass that alias to `--registry`"
-        ),
+        RegistryKind::GitHost => publish_git_skill(registry_name, registry, &skill, options),
+        RegistryKind::Http => publish_http_skill(registry_name, registry, &skill, options),
     }
+}
+
+fn publish_git_skill(
+    registry_name: &str,
+    registry: &RegistryConfig,
+    skill: &knack_core::Skill,
+    options: PublishOptions,
+) -> Result<()> {
+    if options.namespace.is_some() || options.token.is_some() {
+        bail!(
+            "--namespace and --token only apply to HTTP registries; \
+             `{registry_name}` is a git-host registry (namespacing is \
+             derived from the repository owner)"
+        );
+    }
+    let repo = options.repo.as_deref().ok_or_else(|| {
+        anyhow!(
+            "publishing to git-host registry `{registry_name}` requires \
+             --repo <owner/repo>"
+        )
+    })?;
+    let skills_dir = options
+        .skills_dir
+        .unwrap_or_else(|| PathBuf::from("skills"));
+    let skill_path = skill.path.as_path();
+    let no_push = options.no_push;
 
     let repo_url = git_host_repo_url(&registry.url, repo)?;
     let temp_dir = tempfile::tempdir().context("failed to create temporary directory")?;
@@ -1241,7 +1302,7 @@ fn publish_skill(
         "clone publish repository",
     )?;
 
-    let destination = checkout.join(skills_dir).join(&skill.name);
+    let destination = checkout.join(&skills_dir).join(&skill.name);
     if destination.exists() {
         fs::remove_dir_all(&destination)
             .with_context(|| format!("failed to replace {}", destination.display()))?;
@@ -1255,7 +1316,7 @@ fn publish_skill(
         skills_dir.to_string_lossy().replace('\\', "/")
     );
     generate_index(
-        &checkout.join(skills_dir),
+        &checkout.join(&skills_dir),
         &source_prefix,
         &checkout.join("knack.index.toml"),
     )?;
@@ -1268,7 +1329,7 @@ fn publish_skill(
         .output()
         .context("failed to inspect publish repository status")?;
     if status_output.stdout.is_empty() {
-        status("nothing to publish:", skill.name);
+        status("nothing to publish:", &skill.name);
         return Ok(());
     }
 
@@ -1292,8 +1353,106 @@ fn publish_skill(
         ));
     } else {
         run_git(["push"], Some(&checkout), "push published skill")?;
-        status("published skill:", skill.name);
+        status("published skill:", &skill.name);
     }
+    Ok(())
+}
+
+/// Publish a skill straight to an HTTP knack registry's
+/// `PUT /skills/{namespace}/{name}` endpoint — no git repository
+/// involved. The upload body is the exact tarball `knack pack`
+/// produces. Only live registries with publishing enabled accept
+/// this; static snapshots are read-only by construction.
+fn publish_http_skill(
+    registry_name: &str,
+    registry: &RegistryConfig,
+    skill: &knack_core::Skill,
+    options: PublishOptions,
+) -> Result<()> {
+    if options.repo.is_some() || options.skills_dir.is_some() || options.no_push {
+        bail!(
+            "--repo, --skills-dir, and --no-push only apply to git-host \
+             registries; `{registry_name}` is an HTTP registry \
+             (use --namespace and --token instead)"
+        );
+    }
+    let namespace = options.namespace.as_deref().ok_or_else(|| {
+        anyhow!(
+            "publishing to HTTP registry `{registry_name}` requires \
+             --namespace <ns> — the vendor scope the skill installs \
+             under, e.g. `knack add {registry_name}:<ns>/{}`",
+            skill.name
+        )
+    })?;
+    validate_skill_name(namespace)
+        .map_err(|err| anyhow!("invalid --namespace `{namespace}`: {err}"))?;
+    let token = options
+        .token
+        .or_else(|| std::env::var("KNACK_PUBLISH_TOKEN").ok())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "publishing to HTTP registry `{registry_name}` requires a \
+                 publish token; pass --token or set KNACK_PUBLISH_TOKEN"
+            )
+        })?;
+
+    let archive = knack_core::create_skill_archive(&skill.path)?;
+    let qualified = format!("{namespace}/{}", skill.name);
+    let base_url = registry.url.trim_end_matches('/');
+    let publish_url = format!("{base_url}/skills/{qualified}");
+    let response = reqwest::blocking::Client::new()
+        .put(&publish_url)
+        .bearer_auth(&token)
+        .header(reqwest::header::USER_AGENT, "knack")
+        .header(reqwest::header::CONTENT_TYPE, "application/gzip")
+        .body(archive)
+        .send()
+        .with_context(|| format!("failed to upload skill to {publish_url}"))?;
+
+    let status_code = response.status();
+    match status_code {
+        reqwest::StatusCode::OK | reqwest::StatusCode::CREATED => {}
+        // Older knack-registry versions and static snapshots have no
+        // PUT route at all; both surface as 404 (or 405 where an edge
+        // proxy answers for the method).
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED => bail!(
+            "registry `{registry_name}` does not support publishing — it \
+             may be a static snapshot or an older knack-registry; publish \
+             into one of its backing git repositories instead ({publish_url})"
+        ),
+        reqwest::StatusCode::UNAUTHORIZED => bail!(
+            "registry `{registry_name}` rejected the request: missing or \
+             malformed publish token (check --token / KNACK_PUBLISH_TOKEN)"
+        ),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE => bail!(
+            "registry `{registry_name}` rejected the upload: skill archive \
+             exceeds the registry's size limit"
+        ),
+        // 403 (publishing disabled / token not recognised) and 409
+        // (name owned by a git-backed source) carry their diagnosis in
+        // the response body; surface it verbatim.
+        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::CONFLICT => {
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "(unable to read registry response body)".to_string());
+            bail!("registry `{registry_name}` rejected the publish: {body}");
+        }
+        _ => {
+            response
+                .error_for_status()
+                .with_context(|| format!("registry returned an error for {publish_url}"))?;
+            bail!("registry returned an unexpected status {status_code} for {publish_url}");
+        }
+    }
+
+    status(
+        "published skill:",
+        format!("{registry_name}:{qualified} ({base_url})"),
+    );
+    notice(&format!(
+        "install with: knack add {registry_name}:{qualified}"
+    ));
     Ok(())
 }
 
@@ -2696,57 +2855,16 @@ fn copy_dir(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn pack_skill(path: &PathBuf, output: &PathBuf) -> Result<PathBuf> {
+fn pack_skill(path: &Path, output: &Path) -> Result<PathBuf> {
     let skill = read_skill(path)?;
     validate_skill(&skill)?;
 
     fs::create_dir_all(output).with_context(|| format!("failed to create {}", output.display()))?;
     let archive_path = output.join(format!("{}.skill.tar.gz", skill.name));
-    let archive_file = File::create(&archive_path)
-        .with_context(|| format!("failed to create {}", archive_path.display()))?;
-    let encoder = GzEncoder::new(archive_file, Compression::default());
-    let mut archive = Builder::new(encoder);
-
-    let files = collect_files(path)?;
-    for file in files {
-        let relative_path = file.strip_prefix(path).with_context(|| {
-            format!(
-                "failed to make {} relative to {}",
-                file.display(),
-                path.display()
-            )
-        })?;
-        let archive_name = Path::new(&skill.name).join(relative_path);
-        append_file(&mut archive, &file, &archive_name)?;
-    }
-
-    archive.finish()?;
+    let bytes = knack_core::create_skill_archive(path)?;
+    fs::write(&archive_path, bytes)
+        .with_context(|| format!("failed to write {}", archive_path.display()))?;
     Ok(archive_path)
-}
-
-fn append_file(
-    archive: &mut Builder<GzEncoder<File>>,
-    source: &Path,
-    archive_name: &Path,
-) -> Result<()> {
-    let mut file =
-        File::open(source).with_context(|| format!("failed to open {}", source.display()))?;
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("failed to stat {}", source.display()))?;
-
-    let mut header = Header::new_gnu();
-    header.set_size(metadata.len());
-    header.set_mode(0o644);
-    header.set_mtime(0);
-    header.set_uid(0);
-    header.set_gid(0);
-    header.set_cksum();
-
-    archive
-        .append_data(&mut header, archive_name, &mut file)
-        .with_context(|| format!("failed to archive {}", source.display()))?;
-    Ok(())
 }
 
 fn new_skill(name: &str, dir: PathBuf) -> Result<()> {
