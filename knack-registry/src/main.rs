@@ -35,6 +35,7 @@ use knack_core::{
     validate_skill, validate_skill_metadata, validate_skill_name,
 };
 use serde::Deserialize;
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Parser)]
@@ -60,9 +61,11 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct ServeArgs {
-    /// Path to a knack registry index TOML file.
-    #[arg(long, default_value = "knack.index.toml")]
-    index: PathBuf,
+    /// Optional path to a knack registry index TOML file. With --database-url,
+    /// omission creates a database-only registry. Otherwise defaults to
+    /// knack.index.toml.
+    #[arg(long)]
+    index: Option<PathBuf>,
 
     /// Address to bind.
     #[arg(long, default_value = "127.0.0.1:7349")]
@@ -99,11 +102,16 @@ struct ServeArgs {
 
     /// Directory where skills published via `PUT /skills/{ns}/{name}` are
     /// stored. Unlike --cache-dir (rebuildable scratch), this holds canonical
-    /// data: put it on a persistent volume. Publishing is only enabled when
-    /// both --data-dir and at least one publish token are configured; without
-    /// them the registry stays read-only (same surface as a static snapshot).
+    /// data: put it on a persistent volume. For multiple replicas, use
+    /// --database-url instead. Publishing also requires a publish token.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+
+    /// PostgreSQL URL for horizontally scaled live publishing. Published
+    /// metadata and archives are stored in Postgres so every replica sees
+    /// writes immediately. Mutually exclusive with --data-dir.
+    #[arg(long, env = "KNACK_DATABASE_URL")]
+    database_url: Option<String>,
 
     /// Bearer token that authorises publishing. Repeatable to allow several
     /// tokens (e.g. one per team, or old+new during rotation). Prefer
@@ -154,15 +162,33 @@ struct AppState {
     /// either the old (index, locations) pair or the new one — never
     /// a mix where a search hit references a stale cache entry.
     state: Arc<RwLock<IndexedState>>,
-    index_path: PathBuf,
     skills_root: Option<PathBuf>,
     name: Option<String>,
-    source_aliases: BTreeMap<String, String>,
-    /// Present iff publishing is enabled (--data-dir + tokens). None
+    /// Present iff publishing is enabled (a storage backend + tokens). None
     /// keeps the server read-only — the same surface a static
     /// snapshot offers, which is the point: write capability is what
     /// distinguishes a live registry from a baked one.
-    uploads: Option<Arc<UploadStore>>,
+    uploads: Option<PublishStore>,
+}
+
+#[derive(Clone)]
+enum PublishStore {
+    Filesystem(Arc<UploadStore>),
+    Postgres(Arc<PostgresUploadStore>),
+}
+
+impl PublishStore {
+    fn tokens(&self) -> &[String] {
+        match self {
+            Self::Filesystem(store) => &store.tokens,
+            Self::Postgres(store) => &store.tokens,
+        }
+    }
+}
+
+struct PostgresUploadStore {
+    pool: PgPool,
+    tokens: Vec<String>,
 }
 
 /// On-disk store for skills accepted via `PUT /skills/{ns}/{name}`.
@@ -391,48 +417,65 @@ async fn main() -> Result<()> {
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
+    let index_path = args.index.or_else(|| {
+        args.database_url
+            .is_none()
+            .then(|| PathBuf::from("knack.index.toml"))
+    });
     let source_aliases = parse_source_aliases(&args.source_aliases)?;
     let publish_tokens =
         load_publish_tokens(&args.publish_tokens, args.publish_tokens_file.as_deref())?;
-    let uploads = build_upload_store(args.data_dir.clone(), publish_tokens)?;
-
-    // Either the operator pointed us at a persistent volume (Fly.io
-    // / mounted PV / whatever) or we spin up a tempdir that lives
-    // for the process. The latter is the Cloudflare-Containers-style
-    // shape: cache benefits within a container's lifetime, rebuilt
-    // on every cold start.
-    let (cache_base, cache_tempdir) = match args.cache_dir.clone() {
-        Some(path) => (path, None),
-        None => {
-            let tempdir = tempfile::tempdir().context("failed to create cache tempdir")?;
-            (tempdir.path().to_path_buf(), Some(tempdir))
-        }
-    };
-    let source_cache = Arc::new(SourceCache::new(cache_base, cache_tempdir)?);
-
-    let initial = refresh_index_and_cache(
-        &args.index,
-        &source_aliases,
-        &source_cache,
-        uploads.as_deref(),
+    let uploads = build_publish_store(
+        args.data_dir.clone(),
+        args.database_url.as_deref(),
+        publish_tokens,
     )
     .await?;
+
+    let source_cache = if index_path.is_some() {
+        // Either the operator pointed us at a persistent volume or we spin up
+        // per-process scratch. Database-only deployments need no Git cache.
+        let (cache_base, cache_tempdir) = match args.cache_dir.clone() {
+            Some(path) => (path, None),
+            None => {
+                let tempdir = tempfile::tempdir().context("failed to create cache tempdir")?;
+                (tempdir.path().to_path_buf(), Some(tempdir))
+            }
+        };
+        Some(Arc::new(SourceCache::new(cache_base, cache_tempdir)?))
+    } else {
+        None
+    };
+
+    let initial = match (index_path.as_deref(), source_cache.as_deref()) {
+        (Some(index_path), Some(source_cache)) => {
+            refresh_index_and_cache(
+                index_path,
+                &source_aliases,
+                source_cache,
+                filesystem_uploads(uploads.as_ref()).map(AsRef::as_ref),
+            )
+            .await?
+        }
+        (None, None) => IndexedState::default(),
+        _ => unreachable!("index path and source cache are created together"),
+    };
     let state = AppState {
         state: Arc::new(RwLock::new(initial)),
-        index_path: args.index,
         skills_root: args.skills_root,
         name: args.name,
-        source_aliases,
         uploads,
     };
 
-    if args.refresh_interval_seconds > 0 {
+    if args.refresh_interval_seconds > 0
+        && let (Some(index_path), Some(source_cache)) = (index_path, source_cache)
+    {
         spawn_refresh_task(
             state.state.clone(),
-            state.index_path.clone(),
-            state.source_aliases.clone(),
+            index_path,
+            source_aliases,
             source_cache,
-            state.uploads.clone(),
+            filesystem_uploads(state.uploads.as_ref()).cloned(),
             Duration::from_secs(args.refresh_interval_seconds),
         );
     }
@@ -457,7 +500,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route("/skills/{name}/archive", get(skill_archive_legacy))
         // Publish endpoint. Accepts the exact tarball `knack pack`
         // produces. Returns 403 until the operator opts in with
-        // --data-dir + a publish token; this is the live server's
+        // a publish backend + token; this is the live server's
         // key capability over a static snapshot.
         .route("/skills/{namespace}/{name}", put(publish))
         // Raise axum's 2 MB default body cap for skill uploads. GET
@@ -503,16 +546,20 @@ fn load_publish_tokens(flags: &[String], file: Option<&Path>) -> Result<Vec<Stri
 /// authorise them; enabling one without the other is always operator
 /// error, so fail loudly at startup instead of serving a half-open
 /// (or silently disabled) endpoint.
-fn build_upload_store(
+async fn build_publish_store(
     data_dir: Option<PathBuf>,
+    database_url: Option<&str>,
     tokens: Vec<String>,
-) -> Result<Option<Arc<UploadStore>>> {
-    match (data_dir, tokens.is_empty()) {
-        (Some(dir), false) => {
+) -> Result<Option<PublishStore>> {
+    if data_dir.is_some() && database_url.is_some() {
+        bail!("--data-dir and --database-url are mutually exclusive");
+    }
+    match (data_dir, database_url, tokens.is_empty()) {
+        (Some(dir), None, false) => {
             let root = dir.join("skills");
             std::fs::create_dir_all(&root)
                 .with_context(|| format!("failed to create upload dir {}", root.display()))?;
-            Ok(Some(Arc::new(UploadStore {
+            Ok(Some(PublishStore::Filesystem(Arc::new(UploadStore {
                 cached: Arc::new(CachedSource {
                     repo_dir: root.clone(),
                     sha: tokio::sync::RwLock::new(None),
@@ -520,18 +567,50 @@ fn build_upload_store(
                 }),
                 root,
                 tokens,
-            })))
+            }))))
         }
-        (Some(_), true) => bail!(
+        (None, Some(url), false) => {
+            let pool = PgPoolOptions::new()
+                .max_connections(10)
+                .connect(url)
+                .await
+                .context("failed to connect to publish database")?;
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS knack_published_skills (\
+                 namespace TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, \
+                 checksum TEXT NOT NULL, archive BYTEA NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                 PRIMARY KEY (namespace, name))",
+            )
+            .execute(&pool)
+            .await
+            .context("failed to initialise publish database")?;
+            Ok(Some(PublishStore::Postgres(Arc::new(
+                PostgresUploadStore { pool, tokens },
+            ))))
+        }
+        (Some(_), None, true) => bail!(
             "--data-dir requires at least one publish token \
              (--publish-token or --publish-tokens-file); refusing to \
              enable unauthenticated publishing"
         ),
-        (None, false) => bail!(
-            "--publish-token/--publish-tokens-file require --data-dir \
+        (None, Some(_), true) => bail!(
+            "--database-url requires at least one publish token \
+             (--publish-token or --publish-tokens-file); refusing to \
+             enable unauthenticated publishing"
+        ),
+        (None, None, false) => bail!(
+            "--publish-token/--publish-tokens-file require --data-dir or --database-url \
              so published skills have somewhere persistent to live"
         ),
-        (None, true) => Ok(None),
+        (None, None, true) => Ok(None),
+        (Some(_), Some(_), _) => unreachable!("mutual exclusion checked above"),
+    }
+}
+
+fn filesystem_uploads(store: Option<&PublishStore>) -> Option<&Arc<UploadStore>> {
+    match store {
+        Some(PublishStore::Filesystem(store)) => Some(store),
+        _ => None,
     }
 }
 
@@ -1052,21 +1131,20 @@ async fn info(State(state): State<AppState>) -> Json<RegistryInfo> {
 }
 
 async fn get_index(State(state): State<AppState>) -> Json<RegistryIndex> {
-    Json(state.state.read().await.index.clone())
+    Json(effective_index(&state).await)
 }
 
 async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> Json<Vec<IndexedSkill>> {
-    let guard = state.state.read().await;
+    let index = effective_index(&state).await;
     // search() already returns results ranked best-match-first (see
     // RegistryIndex::search); we just attach each result's score onto
     // the cloned IndexedSkill so it survives the JSON round-trip to
     // the client, which merges results across multiple registries and
     // needs the score to re-rank the merged set.
-    let mut results: Vec<IndexedSkill> = guard
-        .index
+    let mut results: Vec<IndexedSkill> = index
         .search(&params.q)
         .into_iter()
         .map(|(skill, score)| {
@@ -1075,7 +1153,6 @@ async fn search(
             skill
         })
         .collect();
-    drop(guard);
     if let Some(name) = &state.name {
         // Rewrite to the install-command form the user can paste:
         //   public:anthropics/pdf   ← when scoped
@@ -1087,6 +1164,53 @@ async fn search(
         }
     }
     Json(results)
+}
+
+async fn effective_index(state: &AppState) -> RegistryIndex {
+    let mut index = state.state.read().await.index.clone();
+    let Some(PublishStore::Postgres(store)) = &state.uploads else {
+        return index;
+    };
+    match postgres_indexed_skills(store).await {
+        Ok(skills) => {
+            let existing: BTreeSet<String> = index
+                .skill
+                .iter()
+                .map(IndexedSkill::qualified_name)
+                .collect();
+            index.skill.extend(
+                skills
+                    .into_iter()
+                    .filter(|skill| !existing.contains(&skill.qualified_name())),
+            );
+            index.skill.sort_by_key(IndexedSkill::qualified_name);
+        }
+        Err(error) => eprintln!("failed to read published skills from Postgres: {error:#}"),
+    }
+    index
+}
+
+async fn postgres_indexed_skills(store: &PostgresUploadStore) -> Result<Vec<IndexedSkill>> {
+    let rows = sqlx::query(
+        "SELECT namespace, name, description FROM knack_published_skills ORDER BY namespace, name",
+    )
+    .fetch_all(&store.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let namespace: String = row.get("namespace");
+            let name: String = row.get("name");
+            IndexedSkill {
+                source: format!("{namespace}/{name}"),
+                namespace: Some(namespace),
+                name,
+                description: row.get("description"),
+                tags: Vec::new(),
+                score: None,
+            }
+        })
+        .collect())
 }
 
 /// Namespaced archive route: `/skills/<namespace>/<name>/archive`.
@@ -1128,9 +1252,8 @@ async fn skill_archive_legacy(
     }
     // Scan the index for any entry whose bare name matches.
     let matches: Vec<(Option<String>, String)> = {
-        let guard = state.state.read().await;
-        guard
-            .index
+        effective_index(&state)
+            .await
             .skill
             .iter()
             .filter(|skill| skill.name == name)
@@ -1232,25 +1355,43 @@ async fn create_skill_archive(
 
     let location = {
         let guard = state.state.read().await;
-        guard
-            .locations
-            .get(qualified)
-            .cloned()
-            .with_context(|| format!("skill not found: {qualified}"))?
+        guard.locations.get(qualified).cloned()
     };
+    if let Some(location) = location {
+        // Hold the cached source's refresh-read lock while we tar the
+        // skill directory. If a background refresh is in progress for
+        // this source, it acquired the corresponding write lock and we
+        // wait briefly — that's better than letting the refresh truncate
+        // the working tree out from under us mid-archive.
+        let _read_guard = location.cached.refresh_lock.read().await;
+        let resolved_sha = location.cached.sha.read().await.clone();
+        let skill_dir = location.cached.repo_dir.join(&location.relative);
+        return Ok(SkillArchive {
+            bytes: create_skill_archive_from_dir(&skill_dir)?,
+            resolved_sha,
+        });
+    }
 
-    // Hold the cached source's refresh-read lock while we tar the
-    // skill directory. If a background refresh is in progress for
-    // this source, it acquired the corresponding write lock and we
-    // wait briefly — that's better than letting the refresh truncate
-    // the working tree out from under us mid-archive.
-    let _read_guard = location.cached.refresh_lock.read().await;
-    let resolved_sha = location.cached.sha.read().await.clone();
-    let skill_dir = location.cached.repo_dir.join(&location.relative);
-    Ok(SkillArchive {
-        bytes: create_skill_archive_from_dir(&skill_dir)?,
-        resolved_sha,
-    })
+    if let Some(PublishStore::Postgres(store)) = &state.uploads {
+        let (namespace, name) = qualified
+            .split_once('/')
+            .with_context(|| format!("skill not found: {qualified}"))?;
+        if let Some(row) = sqlx::query(
+            "SELECT archive FROM knack_published_skills WHERE namespace = $1 AND name = $2",
+        )
+        .bind(namespace)
+        .bind(name)
+        .fetch_optional(&store.pool)
+        .await?
+        {
+            return Ok(SkillArchive {
+                bytes: row.get("archive"),
+                resolved_sha: None,
+            });
+        }
+    }
+
+    bail!("skill not found: {qualified}")
 }
 
 /// Publish endpoint: `PUT /skills/{namespace}/{name}` with a
@@ -1258,11 +1399,9 @@ async fn create_skill_archive(
 /// differentiator over a static snapshot: skills land here directly,
 /// without having to pass through a git repository first.
 ///
-/// Disabled (403) unless the operator opted in with --data-dir plus a
-/// publish token. Authenticated uploads are validated (well-formed
-/// archive, valid SKILL.md, names agree), stored under
-/// `<data-dir>/skills/<namespace>/<name>/`, and folded into the live
-/// index immediately — no waiting for the next background refresh.
+/// Disabled (403) unless the operator opted in with a storage backend
+/// plus a publish token. Authenticated uploads are validated before
+/// being stored and made visible to index, search, and archive reads.
 async fn publish(
     State(state): State<AppState>,
     AxumPath((namespace, name)): AxumPath<(String, String)>,
@@ -1273,7 +1412,7 @@ async fn publish(
         return (
             StatusCode::FORBIDDEN,
             "publishing is not enabled on this registry; the operator must \
-             start knack-registry with --data-dir and --publish-token",
+             configure --data-dir or --database-url with --publish-token",
         )
             .into_response();
     };
@@ -1285,7 +1424,7 @@ async fn publish(
             )
                 .into_response();
         }
-        Some(token) if !token_authorised(token, &uploads.tokens) => {
+        Some(token) if !token_authorised(token, uploads.tokens()) => {
             return (StatusCode::FORBIDDEN, "publish token not recognised").into_response();
         }
         Some(_) => {}
@@ -1320,19 +1459,21 @@ async fn publish(
         }
     }
 
-    let accepted = match accept_upload(&uploads, &namespace, &name, &body).await {
+    let accepted = match &uploads {
+        PublishStore::Filesystem(uploads) => accept_upload(uploads, &namespace, &name, &body).await,
+        PublishStore::Postgres(uploads) => {
+            accept_postgres_upload(uploads, &namespace, &name, &body).await
+        }
+    };
+    let accepted = match accepted {
         Ok(accepted) => accepted,
         Err((status, message)) => return (status, message).into_response(),
     };
 
-    // Fold the skill into the live index immediately so /search,
-    // /index, and archive requests see it without waiting for the
-    // next refresh tick. A refresh pass that raced this publish may
-    // briefly clobber the entry with its pre-publish snapshot; the
-    // skill is already durable on disk, so the following pass walks
-    // it right back in — eventual consistency bounded by the refresh
-    // interval.
-    {
+    // Filesystem uploads need to be folded into this process's live
+    // index. Postgres-backed reads query shared state directly, making
+    // the write visible to all replicas without local invalidation.
+    if let PublishStore::Filesystem(uploads) = &uploads {
         let mut guard = state.state.write().await;
         guard.locations.insert(
             qualified.clone(),
@@ -1452,6 +1593,75 @@ async fn accept_upload(
         description: skill.description,
         checksum,
         replaced,
+    })
+}
+
+async fn accept_postgres_upload(
+    uploads: &PostgresUploadStore,
+    namespace: &str,
+    name: &str,
+    body: &[u8],
+) -> Result<AcceptedUpload, (StatusCode, String)> {
+    fn internal(context: &str, err: impl std::fmt::Display) -> (StatusCode, String) {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{context}: {err}"),
+        )
+    }
+    let staging =
+        tempfile::tempdir().map_err(|err| internal("failed to create staging dir", err))?;
+    let skill_root =
+        unpack_skill_archive(std::io::Cursor::new(body), staging.path()).map_err(|err| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid skill archive: {err:#}"),
+            )
+        })?;
+    let skill = read_skill(&skill_root).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid skill archive: {err:#}"),
+        )
+    })?;
+    validate_skill(&skill).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid skill archive: {err:#}"),
+        )
+    })?;
+    if skill.name != name {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "archive contains skill `{}` but the request URL names `{name}`; \
+                 re-pack the skill or fix the URL",
+                skill.name
+            ),
+        ));
+    }
+    let checksum = checksum_dir(&skill_root)
+        .map_err(|err| internal("failed to checksum upload", format!("{err:#}")))?;
+    let row = sqlx::query(
+        "INSERT INTO knack_published_skills \
+         (namespace, name, description, checksum, archive) VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (namespace, name) DO UPDATE SET \
+         description = EXCLUDED.description, checksum = EXCLUDED.checksum, \
+         archive = EXCLUDED.archive, updated_at = now() \
+         RETURNING (xmax <> 0) AS replaced",
+    )
+    .bind(namespace)
+    .bind(name)
+    .bind(&skill.description)
+    .bind(&checksum)
+    .bind(body)
+    .fetch_one(&uploads.pool)
+    .await
+    .map_err(|err| internal("failed to store uploaded skill", err))?;
+
+    Ok(AcceptedUpload {
+        description: skill.description,
+        checksum,
+        replaced: row.get("replaced"),
     })
 }
 
