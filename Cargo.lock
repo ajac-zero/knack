@@ -708,10 +708,13 @@ name = "knack-core"
 version = "0.3.1"
 dependencies = [
  "anyhow",
+ "flate2",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
+ "tar",
+ "tempfile",
  "toml 1.1.2+spec-1.1.0",
 ]
 
@@ -722,11 +725,9 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
- "flate2",
  "knack-core",
  "serde",
  "serde_json",
- "tar",
  "tempfile",
  "tokio",
  "toml 0.9.12+spec-1.1.0",

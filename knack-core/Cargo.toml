@@ -12,12 +12,23 @@ readme = "../README.md"
 keywords = ["agent", "ai", "skill", "package"]
 categories = ["development-tools"]
 
+[features]
+# Tarball create/unpack helpers shared by the knack CLI and
+# knack-registry. Default-on so `cargo test -p knack-core` exercises
+# them; knack-search-wasm opts out (default-features = false) because
+# tar/flate2 aren't needed — or wanted — on wasm32-unknown-unknown.
+default = ["archive"]
+archive = ["dep:flate2", "dep:tar"]
+
 [dependencies]
 anyhow = "1.0.98"
+flate2 = { version = "1.1.5", optional = true }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_yaml = "0.9.34"
 sha2 = "0.10.9"
+tar = { version = "0.4.44", optional = true }
 
 [dev-dependencies]
 serde_json = "1.0.150"
+tempfile = "3.24.0"
 toml = "1.1.2"

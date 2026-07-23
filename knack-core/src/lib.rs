@@ -8,6 +8,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "archive")]
+mod archive;
+#[cfg(feature = "archive")]
+pub use archive::{create_skill_archive, unpack_skill_archive};
+
 #[derive(Debug)]
 pub struct Skill {
     pub path: PathBuf,
