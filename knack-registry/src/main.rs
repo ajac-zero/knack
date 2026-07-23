@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -18,6 +18,7 @@ use axum::{
 };
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Args, Parser, Subcommand};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 
 /// Colour palette for clap's --help renderer. Matches the knack CLI so
 /// running `--help` on either binary feels like the same toolchain.
@@ -34,9 +35,10 @@ use knack_core::{
     create_skill_archive as create_skill_archive_from_dir, read_skill, unpack_skill_archive,
     validate_skill, validate_skill_metadata, validate_skill_name,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug, Parser)]
 #[command(name = "knack-registry")]
@@ -124,6 +126,42 @@ struct ServeArgs {
     #[arg(long)]
     publish_tokens_file: Option<PathBuf>,
 
+    /// OIDC issuer accepted for self-service human publishing. Must be used
+    /// with --oidc-audience, --oidc-client-id, and --database-url.
+    #[arg(long, env = "KNACK_OIDC_ISSUER")]
+    oidc_issuer: Option<String>,
+
+    /// Audience required in OIDC access tokens presented to this registry.
+    #[arg(long, env = "KNACK_OIDC_AUDIENCE")]
+    oidc_audience: Option<String>,
+
+    /// Public OAuth client ID used by the knack CLI authorization-code flow.
+    #[arg(long, env = "KNACK_OIDC_CLIENT_ID")]
+    oidc_client_id: Option<String>,
+
+    /// Optional access-token scope required for direct publishing. When
+    /// omitted, a valid token for the configured audience may publish.
+    #[arg(long, env = "KNACK_OIDC_REQUIRED_SCOPE")]
+    oidc_required_scope: Option<String>,
+
+    /// Claim used as the candidate for an automatically assigned personal
+    /// namespace. The stable identity remains the token's issuer + subject.
+    #[arg(
+        long,
+        env = "KNACK_OIDC_NAMESPACE_CLAIM",
+        default_value = "preferred_username"
+    )]
+    oidc_namespace_claim: String,
+
+    /// OAuth scopes advertised to `knack auth login`.
+    #[arg(
+        long,
+        env = "KNACK_OIDC_SCOPES",
+        value_delimiter = ',',
+        default_value = "openid,offline_access"
+    )]
+    oidc_scopes: Vec<String>,
+
     /// Maximum accepted size in bytes for a published skill archive.
     #[arg(long, default_value_t = 50 * 1024 * 1024)]
     publish_max_bytes: usize,
@@ -169,6 +207,7 @@ struct AppState {
     /// snapshot offers, which is the point: write capability is what
     /// distinguishes a live registry from a baked one.
     uploads: Option<PublishStore>,
+    oidc: Option<Arc<OidcValidator>>,
 }
 
 #[derive(Clone)]
@@ -189,6 +228,59 @@ impl PublishStore {
 struct PostgresUploadStore {
     pool: PgPool,
     tokens: Vec<String>,
+}
+
+struct OidcValidator {
+    issuer: String,
+    audience: String,
+    client_id: String,
+    required_scope: Option<String>,
+    namespace_claim: String,
+    scopes: Vec<String>,
+    jwks_uri: String,
+    client: reqwest::Client,
+    jwks: RwLock<CachedJwks>,
+    refresh_lock: Mutex<()>,
+}
+
+struct CachedJwks {
+    set: JwkSet,
+    fetched_at: Instant,
+}
+
+#[derive(Debug, Deserialize)]
+struct OidcDiscovery {
+    issuer: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    jwks_uri: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccessTokenClaims {
+    iss: String,
+    sub: String,
+    exp: u64,
+    #[serde(default)]
+    iat: Option<u64>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    scp: Vec<String>,
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug)]
+struct OidcPrincipal {
+    issuer: String,
+    subject: String,
+    namespace_candidate: String,
+}
+
+enum PublishPrincipal {
+    ServiceToken,
+    Oidc(OidcPrincipal),
 }
 
 /// On-disk store for skills accepted via `PUT /skills/{ns}/{name}`.
@@ -395,11 +487,22 @@ fn cache_subdir_name(source: &str) -> String {
 /// `publish` advertises whether `PUT /skills/{ns}/{name}` is enabled —
 /// false for read-only live servers and for static snapshots (whose
 /// baked info.json predates or omits the field).
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 struct RegistryInfo {
     name: Option<String>,
     version: &'static str,
     publish: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authentication: Option<RegistryAuthentication>,
+}
+
+#[derive(Clone, Serialize)]
+struct RegistryAuthentication {
+    r#type: &'static str,
+    issuer: String,
+    client_id: String,
+    audience: String,
+    scopes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -417,7 +520,8 @@ async fn main() -> Result<()> {
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
-    let index_path = args.index.or_else(|| {
+    validate_oidc_args(&args)?;
+    let index_path = args.index.clone().or_else(|| {
         args.database_url
             .is_none()
             .then(|| PathBuf::from("knack.index.toml"))
@@ -425,12 +529,17 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let source_aliases = parse_source_aliases(&args.source_aliases)?;
     let publish_tokens =
         load_publish_tokens(&args.publish_tokens, args.publish_tokens_file.as_deref())?;
+    let has_publish_tokens = !publish_tokens.is_empty();
     let uploads = build_publish_store(
         args.data_dir.clone(),
         args.database_url.as_deref(),
         publish_tokens,
     )
     .await?;
+    let oidc = build_oidc_validator(&args).await?;
+    if matches!(uploads, Some(PublishStore::Postgres(_))) && !has_publish_tokens && oidc.is_none() {
+        bail!("--database-url requires --publish-token or OIDC configuration");
+    }
 
     let source_cache = if index_path.is_some() {
         // Either the operator pointed us at a persistent volume or we spin up
@@ -465,6 +574,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         skills_root: args.skills_root,
         name: args.name,
         uploads,
+        oidc,
     };
 
     if args.refresh_interval_seconds > 0
@@ -498,6 +608,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
         // namespaced entry matches the bare name, 409 with a
         // disambiguation hint when several do, 404 otherwise.
         .route("/skills/{name}/archive", get(skill_archive_legacy))
+        // OIDC personal publishing omits the namespace. The registry derives
+        // and persistently assigns it from the authenticated identity.
+        .route("/skills/{name}", put(publish_personal))
         // Publish endpoint. Accepts the exact tarball `knack pack`
         // produces. Returns 403 until the operator opts in with
         // a publish backend + token; this is the live server's
@@ -542,6 +655,263 @@ fn load_publish_tokens(flags: &[String], file: Option<&Path>) -> Result<Vec<Stri
     Ok(tokens)
 }
 
+fn validate_oidc_args(args: &ServeArgs) -> Result<()> {
+    let configured = [
+        args.oidc_issuer.is_some(),
+        args.oidc_audience.is_some(),
+        args.oidc_client_id.is_some(),
+    ];
+    if configured.iter().any(|value| *value) && !configured.iter().all(|value| *value) {
+        bail!("--oidc-issuer, --oidc-audience, and --oidc-client-id must be configured together");
+    }
+    if args.oidc_issuer.is_some() && args.database_url.is_none() {
+        bail!("OIDC publishing requires --database-url");
+    }
+    Ok(())
+}
+
+async fn build_oidc_validator(args: &ServeArgs) -> Result<Option<Arc<OidcValidator>>> {
+    let Some(issuer) = args.oidc_issuer.as_deref() else {
+        return Ok(None);
+    };
+    let issuer = issuer.trim_end_matches('/').to_string();
+    if !issuer.starts_with("https://") {
+        bail!("--oidc-issuer must use HTTPS");
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("failed to build OIDC HTTP client")?;
+    let discovery_url = format!("{issuer}/.well-known/openid-configuration");
+    let discovery: OidcDiscovery = client
+        .get(&discovery_url)
+        .send()
+        .await
+        .context("failed to fetch OIDC discovery document")?
+        .error_for_status()
+        .context("OIDC discovery endpoint returned an error")?
+        .json()
+        .await
+        .context("failed to parse OIDC discovery document")?;
+    if discovery.issuer.trim_end_matches('/') != issuer {
+        bail!("OIDC discovery issuer does not match --oidc-issuer");
+    }
+    for endpoint in [
+        &discovery.authorization_endpoint,
+        &discovery.token_endpoint,
+        &discovery.jwks_uri,
+    ] {
+        if !endpoint.starts_with("https://") {
+            bail!("OIDC provider endpoints must use HTTPS");
+        }
+    }
+    let set = fetch_jwks(&client, &discovery.jwks_uri).await?;
+    Ok(Some(Arc::new(OidcValidator {
+        issuer,
+        audience: args.oidc_audience.clone().expect("validated OIDC audience"),
+        client_id: args
+            .oidc_client_id
+            .clone()
+            .expect("validated OIDC client ID"),
+        required_scope: args.oidc_required_scope.clone(),
+        namespace_claim: args.oidc_namespace_claim.clone(),
+        scopes: {
+            let mut scopes = args.oidc_scopes.clone();
+            if let Some(required_scope) = &args.oidc_required_scope
+                && !scopes.contains(required_scope)
+            {
+                scopes.push(required_scope.clone());
+            }
+            scopes
+        },
+        jwks_uri: discovery.jwks_uri,
+        client,
+        jwks: RwLock::new(CachedJwks {
+            set,
+            fetched_at: Instant::now(),
+        }),
+        refresh_lock: Mutex::new(()),
+    })))
+}
+
+async fn fetch_jwks(client: &reqwest::Client, uri: &str) -> Result<JwkSet> {
+    client
+        .get(uri)
+        .send()
+        .await
+        .context("failed to fetch OIDC JWKS")?
+        .error_for_status()
+        .context("OIDC JWKS endpoint returned an error")?
+        .json()
+        .await
+        .context("failed to parse OIDC JWKS")
+}
+
+impl OidcValidator {
+    async fn validate(&self, token: &str) -> Result<OidcPrincipal> {
+        let header = decode_header(token).context("invalid JWT header")?;
+        if header.alg != Algorithm::RS256 {
+            bail!("unsupported JWT signing algorithm");
+        }
+        let kid = header.kid.context("JWT is missing kid")?;
+        let key = match self.decoding_key(&kid).await? {
+            Some(key) => key,
+            None => {
+                self.refresh_jwks().await?;
+                self.decoding_key(&kid)
+                    .await?
+                    .context("JWT kid is not present in provider JWKS")?
+            }
+        };
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_issuer(&[&self.issuer]);
+        validation.set_audience(&[&self.audience]);
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+        validation.validate_nbf = true;
+        validation.leeway = 60;
+        let claims = decode::<AccessTokenClaims>(token, &key, &validation)
+            .context("JWT validation failed")?
+            .claims;
+        if claims.iss != self.issuer {
+            bail!("JWT issuer mismatch");
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_secs();
+        if claims.exp <= now.saturating_sub(60) {
+            bail!("JWT has expired");
+        }
+        if claims.iat.is_some_and(|iat| iat > now + 60) {
+            bail!("JWT issued-at time is in the future");
+        }
+        if let Some(required_scope) = &self.required_scope {
+            let has_scope = claims.scope.as_deref().is_some_and(|scope| {
+                scope
+                    .split_ascii_whitespace()
+                    .any(|scope| scope == required_scope)
+            }) || claims.scp.iter().any(|scope| scope == required_scope);
+            if !has_scope {
+                bail!("JWT lacks required publish scope");
+            }
+        }
+        let namespace_candidate = personal_namespace_candidate(
+            claims
+                .extra
+                .get(&self.namespace_claim)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&claims.sub),
+        );
+        Ok(OidcPrincipal {
+            issuer: claims.iss,
+            subject: claims.sub,
+            namespace_candidate,
+        })
+    }
+
+    async fn decoding_key(&self, kid: &str) -> Result<Option<DecodingKey>> {
+        let guard = self.jwks.read().await;
+        guard
+            .set
+            .find(kid)
+            .map(DecodingKey::from_jwk)
+            .transpose()
+            .context("provider returned an unusable JWK")
+    }
+
+    async fn refresh_jwks(&self) -> Result<()> {
+        let _guard = self.refresh_lock.lock().await;
+        if self.jwks.read().await.fetched_at.elapsed() < Duration::from_secs(5) {
+            return Ok(());
+        }
+        let set = fetch_jwks(&self.client, &self.jwks_uri).await?;
+        *self.jwks.write().await = CachedJwks {
+            set,
+            fetched_at: Instant::now(),
+        };
+        Ok(())
+    }
+}
+
+fn personal_namespace_candidate(value: &str) -> String {
+    let mut result = String::new();
+    let mut previous_dash = false;
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            result.push(character);
+            previous_dash = false;
+        } else if !result.is_empty() && !previous_dash {
+            result.push('-');
+            previous_dash = true;
+        }
+    }
+    while result.ends_with('-') {
+        result.pop();
+    }
+    if result.is_empty() {
+        result.push_str("user");
+    }
+    result.truncate(64);
+    while result.ends_with('-') {
+        result.pop();
+    }
+    result
+}
+
+async fn assign_personal_namespace(
+    store: &PostgresUploadStore,
+    principal: &OidcPrincipal,
+) -> Result<String> {
+    if let Some(row) =
+        sqlx::query("SELECT namespace FROM knack_publishers WHERE issuer = $1 AND subject = $2")
+            .bind(&principal.issuer)
+            .bind(&principal.subject)
+            .fetch_optional(&store.pool)
+            .await?
+    {
+        return Ok(row.get("namespace"));
+    }
+
+    let digest = Sha256::digest(format!("{}\0{}", principal.issuer, principal.subject));
+    let suffix = format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    );
+    let mut suffixed_base = principal.namespace_candidate.clone();
+    suffixed_base.truncate(55);
+    while suffixed_base.ends_with('-') {
+        suffixed_base.pop();
+    }
+    for namespace in [
+        principal.namespace_candidate.clone(),
+        format!("{suffixed_base}-{suffix}"),
+    ] {
+        let row = sqlx::query(
+            "INSERT INTO knack_publishers (issuer, subject, namespace) VALUES ($1, $2, $3) \
+             ON CONFLICT DO NOTHING RETURNING namespace",
+        )
+        .bind(&principal.issuer)
+        .bind(&principal.subject)
+        .bind(&namespace)
+        .fetch_optional(&store.pool)
+        .await?;
+        if let Some(row) = row {
+            return Ok(row.get("namespace"));
+        }
+        if let Some(row) =
+            sqlx::query("SELECT namespace FROM knack_publishers WHERE issuer = $1 AND subject = $2")
+                .bind(&principal.issuer)
+                .bind(&principal.subject)
+                .fetch_optional(&store.pool)
+                .await?
+        {
+            return Ok(row.get("namespace"));
+        }
+    }
+    bail!("failed to allocate a unique personal namespace")
+}
+
 /// Publishing requires both a place to keep uploads and a way to
 /// authorise them; enabling one without the other is always operator
 /// error, so fail loudly at startup instead of serving a half-open
@@ -584,6 +954,9 @@ async fn build_publish_store(
             .execute(&pool)
             .await
             .context("failed to initialise publish database")?;
+            initialise_publish_database(&pool)
+                .await
+                .context("failed to migrate publish database")?;
             Ok(Some(PublishStore::Postgres(Arc::new(
                 PostgresUploadStore { pool, tokens },
             ))))
@@ -593,11 +966,17 @@ async fn build_publish_store(
              (--publish-token or --publish-tokens-file); refusing to \
              enable unauthenticated publishing"
         ),
-        (None, Some(_), true) => bail!(
-            "--database-url requires at least one publish token \
-             (--publish-token or --publish-tokens-file); refusing to \
-             enable unauthenticated publishing"
-        ),
+        (None, Some(url), true) => {
+            let pool = PgPoolOptions::new()
+                .max_connections(10)
+                .connect(url)
+                .await
+                .context("failed to connect to publish database")?;
+            initialise_publish_database(&pool).await?;
+            Ok(Some(PublishStore::Postgres(Arc::new(
+                PostgresUploadStore { pool, tokens },
+            ))))
+        }
         (None, None, false) => bail!(
             "--publish-token/--publish-tokens-file require --data-dir or --database-url \
              so published skills have somewhere persistent to live"
@@ -605,6 +984,42 @@ async fn build_publish_store(
         (None, None, true) => Ok(None),
         (Some(_), Some(_), _) => unreachable!("mutual exclusion checked above"),
     }
+}
+
+async fn initialise_publish_database(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS knack_published_skills (\
+         namespace TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, \
+         checksum TEXT NOT NULL, archive BYTEA NOT NULL, \
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (namespace, name))",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS knack_publishers (\
+         issuer TEXT NOT NULL, subject TEXT NOT NULL, namespace TEXT NOT NULL UNIQUE, \
+         created_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (issuer, subject))",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE knack_published_skills \
+         ADD COLUMN IF NOT EXISTS publisher_issuer TEXT, \
+         ADD COLUMN IF NOT EXISTS publisher_subject TEXT, \
+         ADD COLUMN IF NOT EXISTS publisher TEXT, \
+         ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS knack_publish_events (\
+         id BIGSERIAL PRIMARY KEY, namespace TEXT NOT NULL, name TEXT NOT NULL, \
+         publisher TEXT NOT NULL, checksum TEXT NOT NULL, action TEXT NOT NULL, \
+         published_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 fn filesystem_uploads(store: Option<&PublishStore>) -> Option<&Arc<UploadStore>> {
@@ -666,6 +1081,7 @@ async fn build_static(args: BuildStaticArgs) -> Result<()> {
         // A static snapshot has no write path by definition — that's
         // the live server's differentiator.
         publish: false,
+        authentication: None,
     };
     let info_path = args.output.join("info.json");
     std::fs::write(&info_path, serde_json::to_string_pretty(&info)?)
@@ -917,6 +1333,9 @@ async fn refresh_index_and_cache(
                 description: skill.description,
                 source: skill_source,
                 tags: source.tags.clone(),
+                publisher: None,
+                published_at: None,
+                updated_at: None,
                 score: None,
             });
         }
@@ -1032,6 +1451,9 @@ async fn collect_uploaded_skills(
                 // rewrite /search performs for named registries.
                 source: qualified,
                 tags: Vec::new(),
+                publisher: None,
+                published_at: None,
+                updated_at: None,
                 score: None,
             });
         }
@@ -1127,6 +1549,13 @@ async fn info(State(state): State<AppState>) -> Json<RegistryInfo> {
         name: state.name.clone(),
         version: env!("CARGO_PKG_VERSION"),
         publish: state.uploads.is_some(),
+        authentication: state.oidc.as_ref().map(|oidc| RegistryAuthentication {
+            r#type: "oidc",
+            issuer: oidc.issuer.clone(),
+            client_id: oidc.client_id.clone(),
+            audience: oidc.audience.clone(),
+            scopes: oidc.scopes.clone(),
+        }),
     })
 }
 
@@ -1192,7 +1621,8 @@ async fn effective_index(state: &AppState) -> RegistryIndex {
 
 async fn postgres_indexed_skills(store: &PostgresUploadStore) -> Result<Vec<IndexedSkill>> {
     let rows = sqlx::query(
-        "SELECT namespace, name, description FROM knack_published_skills ORDER BY namespace, name",
+        "SELECT namespace, name, description, publisher, created_at::TEXT AS published_at, \
+         updated_at::TEXT AS updated_at FROM knack_published_skills ORDER BY namespace, name",
     )
     .fetch_all(&store.pool)
     .await?;
@@ -1207,6 +1637,9 @@ async fn postgres_indexed_skills(store: &PostgresUploadStore) -> Result<Vec<Inde
                 name,
                 description: row.get("description"),
                 tags: Vec::new(),
+                publisher: row.get("publisher"),
+                published_at: row.get("published_at"),
+                updated_at: row.get("updated_at"),
                 score: None,
             }
         })
@@ -1416,18 +1849,16 @@ async fn publish(
         )
             .into_response();
     };
-    match bearer_token(&headers) {
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "publishing requires an `Authorization: Bearer <token>` header",
-            )
-                .into_response();
-        }
-        Some(token) if !token_authorised(token, uploads.tokens()) => {
-            return (StatusCode::FORBIDDEN, "publish token not recognised").into_response();
-        }
-        Some(_) => {}
+    let principal = match authenticate_publish(&headers, &uploads, state.oidc.as_deref()).await {
+        Ok(principal) => principal,
+        Err((status, message)) => return (status, message).into_response(),
+    };
+    if matches!(principal, PublishPrincipal::Oidc(_)) {
+        return (
+            StatusCode::FORBIDDEN,
+            "OIDC users publish to their automatically assigned personal namespace; omit --namespace",
+        )
+            .into_response();
     }
     if validate_skill_name(&namespace).is_err() || validate_skill_name(&name).is_err() {
         return (
@@ -1436,33 +1867,109 @@ async fn publish(
         )
             .into_response();
     }
+    publish_to_namespace(state, uploads, namespace, name, body, None).await
+}
+
+async fn publish_personal(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(uploads) = state.uploads.clone() else {
+        return (StatusCode::FORBIDDEN, "publishing is not enabled").into_response();
+    };
+    if validate_skill_name(&name).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "name must be a kebab-case identifier",
+        )
+            .into_response();
+    }
+    let principal = match authenticate_publish(&headers, &uploads, state.oidc.as_deref()).await {
+        Ok(PublishPrincipal::Oidc(principal)) => principal,
+        Ok(PublishPrincipal::ServiceToken) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "service-token publishes must include an explicit namespace",
+            )
+                .into_response();
+        }
+        Err((status, message)) => return (status, message).into_response(),
+    };
+    let PublishStore::Postgres(store) = &uploads else {
+        return (StatusCode::FORBIDDEN, "OIDC publishing requires Postgres").into_response();
+    };
+    let namespace = match assign_personal_namespace(store, &principal).await {
+        Ok(namespace) => namespace,
+        Err(error) => {
+            eprintln!("failed to assign personal namespace: {error:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to assign personal namespace",
+            )
+                .into_response();
+        }
+    };
+    let publisher = format!("{}#{}", principal.issuer, principal.subject);
+    publish_to_namespace(state, uploads, namespace, name, body, Some(publisher)).await
+}
+
+async fn authenticate_publish(
+    headers: &HeaderMap,
+    uploads: &PublishStore,
+    oidc: Option<&OidcValidator>,
+) -> Result<PublishPrincipal, (StatusCode, &'static str)> {
+    let Some(token) = bearer_token(headers) else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "publishing requires an `Authorization: Bearer <token>` header",
+        ));
+    };
+    if token_authorised(token, uploads.tokens()) {
+        return Ok(PublishPrincipal::ServiceToken);
+    }
+    let Some(oidc) = oidc else {
+        return Err((StatusCode::FORBIDDEN, "publish token not recognised"));
+    };
+    oidc.validate(token)
+        .await
+        .map(PublishPrincipal::Oidc)
+        .map_err(|error| {
+            eprintln!("OIDC publish authentication failed: {error:#}");
+            (StatusCode::UNAUTHORIZED, "OIDC access token is invalid")
+        })
+}
+
+async fn publish_to_namespace(
+    state: AppState,
+    uploads: PublishStore,
+    namespace: String,
+    name: String,
+    body: Bytes,
+    publisher: Option<String>,
+) -> Response {
     let qualified = format!("{namespace}/{name}");
 
-    // Refuse to shadow a git-backed skill. Those are declared in the
-    // operator-managed index TOML; an upload silently masking one
-    // would be undebuggable. Re-publishing over a previous upload is
-    // the normal update flow and sails through.
     {
         let guard = state.state.read().await;
-        if let Some(existing) = guard.locations.get(&qualified) {
-            if !existing.from_upload {
-                return (
-                    StatusCode::CONFLICT,
-                    format!(
-                        "skill `{qualified}` is provided by a git-backed source in the \
-                         registry index; publish through that repository (or remove the \
-                         index entry) instead"
-                    ),
-                )
-                    .into_response();
-            }
+        if let Some(existing) = guard.locations.get(&qualified)
+            && !existing.from_upload
+        {
+            return (
+                StatusCode::CONFLICT,
+                format!(
+                    "skill `{qualified}` is provided by a git-backed source in the registry index"
+                ),
+            )
+                .into_response();
         }
     }
 
     let accepted = match &uploads {
         PublishStore::Filesystem(uploads) => accept_upload(uploads, &namespace, &name, &body).await,
         PublishStore::Postgres(uploads) => {
-            accept_postgres_upload(uploads, &namespace, &name, &body).await
+            accept_postgres_upload(uploads, &namespace, &name, &body, publisher.as_deref()).await
         }
     };
     let accepted = match accepted {
@@ -1470,9 +1977,6 @@ async fn publish(
         Err((status, message)) => return (status, message).into_response(),
     };
 
-    // Filesystem uploads need to be folded into this process's live
-    // index. Postgres-backed reads query shared state directly, making
-    // the write visible to all replicas without local invalidation.
     if let PublishStore::Filesystem(uploads) = &uploads {
         let mut guard = state.state.write().await;
         guard.locations.insert(
@@ -1493,12 +1997,12 @@ async fn publish(
             description: accepted.description,
             source: qualified,
             tags: Vec::new(),
+            publisher: None,
+            published_at: None,
+            updated_at: None,
             score: None,
         });
-        guard
-            .index
-            .skill
-            .sort_by_key(|skill| skill.qualified_name());
+        guard.index.skill.sort_by_key(IndexedSkill::qualified_name);
     }
 
     let status = if accepted.replaced {
@@ -1511,6 +2015,7 @@ async fn publish(
         Json(serde_json::json!({
             "name": name,
             "namespace": namespace,
+            "publisher": publisher,
             "checksum": accepted.checksum,
             "replaced": accepted.replaced,
         })),
@@ -1601,6 +2106,7 @@ async fn accept_postgres_upload(
     namespace: &str,
     name: &str,
     body: &[u8],
+    publisher: Option<&str>,
 ) -> Result<AcceptedUpload, (StatusCode, String)> {
     fn internal(context: &str, err: impl std::fmt::Display) -> (StatusCode, String) {
         (
@@ -1641,12 +2147,17 @@ async fn accept_postgres_upload(
     }
     let checksum = checksum_dir(&skill_root)
         .map_err(|err| internal("failed to checksum upload", format!("{err:#}")))?;
+    let mut transaction = uploads
+        .pool
+        .begin()
+        .await
+        .map_err(|err| internal("failed to begin publish transaction", err))?;
     let row = sqlx::query(
         "INSERT INTO knack_published_skills \
-         (namespace, name, description, checksum, archive) VALUES ($1, $2, $3, $4, $5) \
+         (namespace, name, description, checksum, archive, publisher) VALUES ($1, $2, $3, $4, $5, $6) \
          ON CONFLICT (namespace, name) DO UPDATE SET \
          description = EXCLUDED.description, checksum = EXCLUDED.checksum, \
-         archive = EXCLUDED.archive, updated_at = now() \
+         archive = EXCLUDED.archive, publisher = EXCLUDED.publisher, updated_at = now() \
          RETURNING (xmax <> 0) AS replaced",
     )
     .bind(namespace)
@@ -1654,14 +2165,34 @@ async fn accept_postgres_upload(
     .bind(&skill.description)
     .bind(&checksum)
     .bind(body)
-    .fetch_one(&uploads.pool)
+    .bind(publisher)
+    .fetch_one(&mut *transaction)
     .await
     .map_err(|err| internal("failed to store uploaded skill", err))?;
+    let replaced: bool = row.get("replaced");
+    if let Some(publisher) = publisher {
+        sqlx::query(
+            "INSERT INTO knack_publish_events \
+             (namespace, name, publisher, checksum, action) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(namespace)
+        .bind(name)
+        .bind(publisher)
+        .bind(&checksum)
+        .bind(if replaced { "updated" } else { "created" })
+        .execute(&mut *transaction)
+        .await
+        .map_err(|err| internal("failed to record publish event", err))?;
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|err| internal("failed to commit publish", err))?;
 
     Ok(AcceptedUpload {
         description: skill.description,
         checksum,
-        replaced: row.get("replaced"),
+        replaced,
     })
 }
 
@@ -1688,6 +2219,39 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalises_personal_namespace_candidates() {
+        assert_eq!(personal_namespace_candidate("Alice Smith"), "alice-smith");
+        assert_eq!(
+            personal_namespace_candidate("alice@example.com"),
+            "alice-example-com"
+        );
+        assert_eq!(personal_namespace_candidate("---"), "user");
+        assert!(personal_namespace_candidate(&"a".repeat(100)).len() <= 64);
+    }
+
+    #[test]
+    fn extracts_only_bearer_authorization() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(bearer_token(&headers), None);
+        headers.insert(header::AUTHORIZATION, "Basic abc".parse().unwrap());
+        assert_eq!(bearer_token(&headers), None);
+        headers.insert(header::AUTHORIZATION, "Bearer secret".parse().unwrap());
+        assert_eq!(bearer_token(&headers), Some("secret"));
+    }
+
+    #[test]
+    fn compares_service_tokens() {
+        assert!(token_authorised("secret", &["secret".to_string()]));
+        assert!(!token_authorised("other", &["secret".to_string()]));
+        assert!(!constant_time_eq(b"short", b"longer"));
+    }
 }
 
 /// Decomposed backing-source URL: where to clone from, which ref to

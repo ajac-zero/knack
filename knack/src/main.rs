@@ -1,15 +1,21 @@
 use std::{
     fmt,
     fs::{self, File},
-    io::Cursor,
+    io::{Cursor, Read, Write},
+    net::TcpListener,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
 };
 
 use anstyle::{AnsiColor, Effects, Style};
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::builder::styling::Styles;
 use clap::{Parser, Subcommand};
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use url::Url;
 
 /// Colour palette for clap's --help renderer. Matches the runtime
 /// success/accent/label palette used by the status() helper so the
@@ -37,6 +43,53 @@ const HELP_STYLES: Styles = Styles::styled()
 /// written with.
 const PUBLIC_REGISTRY_NAME: &str = "public";
 const PUBLIC_REGISTRY_URL: &str = "https://knack.ajac-zero.com";
+
+#[derive(Debug, Deserialize)]
+struct RegistryInfo {
+    #[serde(default)]
+    authentication: Option<RegistryAuthentication>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryAuthentication {
+    r#type: String,
+    issuer: String,
+    client_id: String,
+    scopes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OidcDiscovery {
+    issuer: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OidcTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Credentials {
+    #[serde(default)]
+    registry: std::collections::BTreeMap<String, StoredCredential>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredCredential {
+    access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<u64>,
+    token_endpoint: String,
+    client_id: String,
+}
 
 use knack_core::{
     IndexedSkill, LockedSkill, Lockfile, Manifest, RegistryConfig, RegistryIndex, RegistryKind,
@@ -248,6 +301,12 @@ enum Command {
         command: RegistryCommand,
     },
 
+    /// Sign in or out of an HTTP registry.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+
     /// Manage registry indexes.
     Index {
         #[command(subcommand)]
@@ -322,6 +381,35 @@ enum IndexCommand {
         /// Output index file.
         #[arg(short, long, default_value = "knack.index.toml")]
         output: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommand {
+    /// Sign in with the registry's configured OpenID Connect provider.
+    Login {
+        /// Registry alias to authenticate with.
+        #[arg(long)]
+        registry: String,
+
+        /// Path to a project manifest used to resolve registry aliases.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Print the authorization URL without opening a browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
+
+    /// Remove locally stored credentials for a registry.
+    Logout {
+        /// Registry alias.
+        #[arg(long)]
+        registry: String,
+
+        /// Path to a project manifest used to resolve registry aliases.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
 }
 
@@ -495,6 +583,249 @@ fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("HOME is not set; cannot resolve global skill directory"))
+}
+
+fn credentials_path() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".agents/knack-credentials.toml"))
+}
+
+fn load_credentials() -> Result<Credentials> {
+    let path = credentials_path()?;
+    if !path.exists() {
+        return Ok(Credentials::default());
+    }
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn save_credentials(credentials: &Credentials) -> Result<()> {
+    let path = credentials_path()?;
+    let parent = path.parent().context("credentials path has no parent")?;
+    fs::create_dir_all(parent)?;
+    fs::write(&path, toml::to_string_pretty(credentials)?)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn resolve_http_registry(manifest_path: Option<&Path>, name: &str) -> Result<RegistryConfig> {
+    let (manifest, resolved_path) = read_manifest_for_read(manifest_path)?;
+    let registries = effective_registries(&manifest, &resolved_path)?;
+    let registry = registries.get(name).cloned().ok_or_else(|| {
+        anyhow!(
+            "unknown registry `{name}`{}",
+            unknown_registry_hint(&registries)
+        )
+    })?;
+    if registry.kind != RegistryKind::Http {
+        bail!("registry `{name}` is not an HTTP registry");
+    }
+    Ok(registry)
+}
+
+fn fetch_registry_info(url: &str) -> Result<RegistryInfo> {
+    let info_url = format!("{}/info", url.trim_end_matches('/'));
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?
+        .get(&info_url)
+        .send()
+        .with_context(|| format!("failed to fetch {info_url}"))?
+        .error_for_status()?
+        .json()
+        .with_context(|| format!("failed to parse {info_url}"))
+}
+
+fn oidc_login(manifest_path: Option<&Path>, registry_name: &str, no_browser: bool) -> Result<()> {
+    let registry = resolve_http_registry(manifest_path, registry_name)?;
+    let info = fetch_registry_info(&registry.url)?;
+    let auth = info
+        .authentication
+        .context("registry does not advertise OIDC authentication")?;
+    if auth.r#type != "oidc" {
+        bail!(
+            "registry advertises unsupported authentication type `{}`",
+            auth.r#type
+        );
+    }
+    let issuer = auth.issuer.trim_end_matches('/');
+    let discovery_url = format!("{issuer}/.well-known/openid-configuration");
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let discovery: OidcDiscovery = client
+        .get(&discovery_url)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    if discovery.issuer.trim_end_matches('/') != issuer {
+        bail!("OIDC discovery issuer does not match registry configuration");
+    }
+    let listener = TcpListener::bind(("127.0.0.1", 0)).context("failed to bind login callback")?;
+    listener.set_nonblocking(true)?;
+    let redirect_uri = format!(
+        "http://127.0.0.1:{}/callback",
+        listener.local_addr()?.port()
+    );
+    let mut random = [0u8; 32];
+    rand::rng().fill_bytes(&mut random);
+    let state = URL_SAFE_NO_PAD.encode(random);
+    rand::rng().fill_bytes(&mut random);
+    let verifier = URL_SAFE_NO_PAD.encode(random);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let mut authorization_url = Url::parse(&discovery.authorization_endpoint)?;
+    authorization_url
+        .query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &auth.client_id)
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("scope", &auth.scopes.join(" "))
+        .append_pair("state", &state)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256");
+    println!("Open this URL to sign in:\n\n{authorization_url}\n");
+    if !no_browser {
+        let _ = webbrowser::open(authorization_url.as_str());
+    }
+    let code = receive_oauth_callback(listener, &state)?;
+    let tokens: OidcTokenResponse = client
+        .post(&discovery.token_endpoint)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("client_id", auth.client_id.as_str()),
+            ("code_verifier", verifier.as_str()),
+        ])
+        .send()?
+        .error_for_status()
+        .context("OIDC token exchange failed")?
+        .json()?;
+    let expires_at = tokens
+        .expires_in
+        .map(|seconds| unix_time().saturating_add(seconds));
+    let mut credentials = load_credentials()?;
+    credentials.registry.insert(
+        registry.url.trim_end_matches('/').to_string(),
+        StoredCredential {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            expires_at,
+            token_endpoint: discovery.token_endpoint,
+            client_id: auth.client_id,
+        },
+    );
+    save_credentials(&credentials)?;
+    status("signed in to:", registry_name);
+    Ok(())
+}
+
+fn receive_oauth_callback(listener: TcpListener, expected_state: &str) -> Result<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    bail!("timed out waiting for OIDC login");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => return Err(error).context("failed to accept OIDC callback"),
+        }
+    };
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(180)))?;
+    let mut request = [0u8; 8192];
+    let bytes_read = stream.read(&mut request)?;
+    let request =
+        std::str::from_utf8(&request[..bytes_read]).context("login callback was not valid HTTP")?;
+    let target = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("invalid login callback request")?;
+    let url = Url::parse(&format!("http://127.0.0.1{target}"))?;
+    if url.path() != "/callback" {
+        bail!("invalid login callback path");
+    }
+    let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    let response = if params
+        .get("state")
+        .is_some_and(|state| state == expected_state)
+    {
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nLogin complete. You may close this window."
+    } else {
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nLogin failed."
+    };
+    stream.write_all(response.as_bytes())?;
+    if let Some(error) = params.get("error") {
+        bail!("OIDC provider rejected login: {error}");
+    }
+    if params
+        .get("state")
+        .is_none_or(|state| state != expected_state)
+    {
+        bail!("OIDC login state mismatch");
+    }
+    params
+        .get("code")
+        .cloned()
+        .context("OIDC callback omitted authorization code")
+}
+
+fn unix_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn stored_publish_token(registry_url: &str) -> Result<Option<String>> {
+    let key = registry_url.trim_end_matches('/');
+    let mut credentials = load_credentials()?;
+    let Some(credential) = credentials.registry.get_mut(key) else {
+        return Ok(None);
+    };
+    if credential
+        .expires_at
+        .is_none_or(|expires| expires > unix_time() + 60)
+    {
+        return Ok(Some(credential.access_token.clone()));
+    }
+    let Some(refresh_token) = credential.refresh_token.as_deref() else {
+        bail!("stored login has expired; run `knack auth login --registry <name>` again");
+    };
+    let response: OidcTokenResponse = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?
+        .post(&credential.token_endpoint)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", credential.client_id.as_str()),
+        ])
+        .send()?
+        .error_for_status()
+        .context("failed to refresh OIDC login; sign in again")?
+        .json()?;
+    credential.access_token = response.access_token;
+    if response.refresh_token.is_some() {
+        credential.refresh_token = response.refresh_token;
+    }
+    credential.expires_at = response
+        .expires_in
+        .map(|seconds| unix_time().saturating_add(seconds));
+    let access_token = credential.access_token.clone();
+    save_credentials(&credentials)?;
+    Ok(Some(access_token))
 }
 
 fn resolve_manifest_path(manifest: Option<PathBuf>, scope: Scope) -> Result<PathBuf> {
@@ -694,6 +1025,7 @@ fn main() -> Result<()> {
         Command::Registry { command } => {
             handle_registry_command(command)?;
         }
+        Command::Auth { command } => handle_auth_command(command)?,
         Command::Index { command } => {
             handle_index_command(command)?;
         }
@@ -725,6 +1057,26 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn handle_auth_command(command: AuthCommand) -> Result<()> {
+    match command {
+        AuthCommand::Login {
+            registry,
+            manifest,
+            no_browser,
+        } => oidc_login(manifest.as_deref(), &registry, no_browser),
+        AuthCommand::Logout { registry, manifest } => {
+            let registry_config = resolve_http_registry(manifest.as_deref(), &registry)?;
+            let mut credentials = load_credentials()?;
+            credentials
+                .registry
+                .remove(registry_config.url.trim_end_matches('/'));
+            save_credentials(&credentials)?;
+            status("signed out of:", registry);
+            Ok(())
+        }
+    }
 }
 
 fn handle_registry_command(command: RegistryCommand) -> Result<()> {
@@ -808,6 +1160,9 @@ fn generate_index(root: &Path, source_prefix: &str, output: &Path) -> Result<()>
             description: skill.description,
             source: format!("{}/{}", source_prefix.trim_end_matches('/'), relative),
             tags: Vec::new(),
+            publisher: None,
+            published_at: None,
+            updated_at: None,
             score: None,
         });
     }
@@ -1376,31 +1731,35 @@ fn publish_http_skill(
              (use --namespace and --token instead)"
         );
     }
-    let namespace = options.namespace.as_deref().ok_or_else(|| {
-        anyhow!(
-            "publishing to HTTP registry `{registry_name}` requires \
-             --namespace <ns> — the vendor scope the skill installs \
-             under, e.g. `knack add {registry_name}:<ns>/{}`",
-            skill.name
-        )
-    })?;
-    validate_skill_name(namespace)
-        .map_err(|err| anyhow!("invalid --namespace `{namespace}`: {err}"))?;
-    let token = options
+    if let Some(namespace) = options.namespace.as_deref() {
+        validate_skill_name(namespace)
+            .map_err(|err| anyhow!("invalid --namespace `{namespace}`: {err}"))?;
+    }
+    let explicit_token = options
         .token
         .or_else(|| std::env::var("KNACK_PUBLISH_TOKEN").ok())
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| {
+        .filter(|token| !token.is_empty());
+    let using_service_token = explicit_token.is_some();
+    let token = match explicit_token {
+        Some(token) => token,
+        None => stored_publish_token(&registry.url)?.ok_or_else(|| {
             anyhow!(
-                "publishing to HTTP registry `{registry_name}` requires a \
-                 publish token; pass --token or set KNACK_PUBLISH_TOKEN"
+                "publishing to HTTP registry `{registry_name}` requires authentication; \
+                 run `knack auth login --registry {registry_name}`, pass --token, or set \
+                 KNACK_PUBLISH_TOKEN"
             )
-        })?;
+        })?,
+    };
+    if using_service_token && options.namespace.is_none() {
+        bail!("service-token publishing requires --namespace <ns>");
+    }
 
     let archive = knack_core::create_skill_archive(&skill.path)?;
-    let qualified = format!("{namespace}/{}", skill.name);
     let base_url = registry.url.trim_end_matches('/');
-    let publish_url = format!("{base_url}/skills/{qualified}");
+    let publish_url = match options.namespace.as_deref() {
+        Some(namespace) => format!("{base_url}/skills/{namespace}/{}", skill.name),
+        None => format!("{base_url}/skills/{}", skill.name),
+    };
     let response = reqwest::blocking::Client::new()
         .put(&publish_url)
         .bearer_auth(&token)
@@ -1446,6 +1805,15 @@ fn publish_http_skill(
         }
     }
 
+    #[derive(Deserialize)]
+    struct PublishResponse {
+        namespace: String,
+        name: String,
+    }
+    let published: PublishResponse = response
+        .json()
+        .context("failed to parse registry publish response")?;
+    let qualified = format!("{}/{}", published.namespace, published.name);
     status(
         "published skill:",
         format!("{registry_name}:{qualified} ({base_url})"),
