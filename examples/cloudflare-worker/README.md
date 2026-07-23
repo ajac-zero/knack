@@ -235,3 +235,8 @@ via wrangler.toml's `[build]` block.
 - **Server-side index mutation**. Everything is bake-and-publish. To
   change the registry's contents, edit `registries/public.toml` in
   the repo and wait for the next cron tick (or trigger manually).
+- **Direct publishing**. `knack publish` against an HTTP registry
+  uploads to `PUT /skills/{ns}/{name}`, which only a live
+  `knack-registry` started with `--data-dir` + `--publish-token`
+  serves. The baked `info.json` advertises `"publish": false`, so
+  clients get an actionable error instead of a mystery 404.

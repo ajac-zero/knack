@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    fs::File,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
@@ -11,11 +10,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{Path as AxumPath, Query, State},
-    http::{StatusCode, header},
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, put},
 };
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Args, Parser, Subcommand};
@@ -30,13 +29,12 @@ const HELP_STYLES: Styles = Styles::styled()
     .error(AnsiColor::Red.on_default().effects(Effects::BOLD))
     .valid(AnsiColor::Green.on_default())
     .invalid(AnsiColor::Yellow.on_default());
-use flate2::{Compression, write::GzEncoder};
 use knack_core::{
-    IndexedSkill, RegistryIndex, collect_files, read_skill, validate_skill_metadata,
-    validate_skill_name,
+    IndexedSkill, RegistryIndex, checksum_dir,
+    create_skill_archive as create_skill_archive_from_dir, read_skill, unpack_skill_archive,
+    validate_skill, validate_skill_metadata, validate_skill_name,
 };
 use serde::Deserialize;
-use tar::{Builder, Header};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Parser)]
@@ -98,6 +96,29 @@ struct ServeArgs {
     /// this at a mounted volume to keep the cache across container restarts.
     #[arg(long)]
     cache_dir: Option<PathBuf>,
+
+    /// Directory where skills published via `PUT /skills/{ns}/{name}` are
+    /// stored. Unlike --cache-dir (rebuildable scratch), this holds canonical
+    /// data: put it on a persistent volume. Publishing is only enabled when
+    /// both --data-dir and at least one publish token are configured; without
+    /// them the registry stays read-only (same surface as a static snapshot).
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+
+    /// Bearer token that authorises publishing. Repeatable to allow several
+    /// tokens (e.g. one per team, or old+new during rotation). Prefer
+    /// --publish-tokens-file where the process list is visible to others.
+    #[arg(long = "publish-token")]
+    publish_tokens: Vec<String>,
+
+    /// File containing publish tokens, one per line. Blank lines and lines
+    /// starting with '#' are ignored. Combined with any --publish-token flags.
+    #[arg(long)]
+    publish_tokens_file: Option<PathBuf>,
+
+    /// Maximum accepted size in bytes for a published skill archive.
+    #[arg(long, default_value_t = 50 * 1024 * 1024)]
+    publish_max_bytes: usize,
 }
 
 #[derive(Debug, Args)]
@@ -137,6 +158,32 @@ struct AppState {
     skills_root: Option<PathBuf>,
     name: Option<String>,
     source_aliases: BTreeMap<String, String>,
+    /// Present iff publishing is enabled (--data-dir + tokens). None
+    /// keeps the server read-only — the same surface a static
+    /// snapshot offers, which is the point: write capability is what
+    /// distinguishes a live registry from a baked one.
+    uploads: Option<Arc<UploadStore>>,
+}
+
+/// On-disk store for skills accepted via `PUT /skills/{ns}/{name}`.
+/// Uploaded skills live at `<data-dir>/skills/<namespace>/<name>/` as
+/// plain directories — the same shape every other part of the registry
+/// consumes — and are walked back into the index on each refresh, so
+/// they survive restarts without any database.
+#[derive(Debug)]
+struct UploadStore {
+    /// `<data-dir>/skills`. Namespace directories live directly below.
+    root: PathBuf,
+    /// Synthetic cache entry covering the whole upload tree. Reuses
+    /// the CachedSource concurrency discipline: archive reads and the
+    /// refresh walk take `refresh_lock.read()`, a publish swapping a
+    /// skill directory takes `write()`. `sha` stays None — uploads
+    /// have no git provenance, clients fall back to checksum-based
+    /// change detection.
+    cached: Arc<CachedSource>,
+    /// Accepted `Authorization: Bearer` values. Non-empty by
+    /// construction (see build_upload_store).
+    tokens: Vec<String>,
 }
 
 /// What the registry exposes to clients (`index`) plus how to actually
@@ -160,6 +207,12 @@ struct SkillLocation {
     /// `[[skill]]` entry whose source already names a specific
     /// skill, this is the same subpath used in the source URL.
     relative: PathBuf,
+    /// True when this skill came from the upload store rather than a
+    /// git-backed source. The publish endpoint uses this to decide
+    /// between "overwrite the previous upload" (allowed) and "shadow
+    /// a git-backed skill" (409 — the git source is config-managed
+    /// and an upload silently masking it would be undebuggable).
+    from_upload: bool,
 }
 
 /// A backing repo on disk that can be refreshed in place. The
@@ -313,10 +366,14 @@ fn cache_subdir_name(source: &str) -> String {
 /// Payload returned by GET /info so clients can self-configure on
 /// `knack registry add <url>` without having to be told the name out of
 /// band. `name` is null when the registry wasn't started with `--name`.
+/// `publish` advertises whether `PUT /skills/{ns}/{name}` is enabled —
+/// false for read-only live servers and for static snapshots (whose
+/// baked info.json predates or omits the field).
 #[derive(serde::Serialize)]
 struct RegistryInfo {
     name: Option<String>,
     version: &'static str,
+    publish: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,6 +392,9 @@ async fn main() -> Result<()> {
 
 async fn serve(args: ServeArgs) -> Result<()> {
     let source_aliases = parse_source_aliases(&args.source_aliases)?;
+    let publish_tokens =
+        load_publish_tokens(&args.publish_tokens, args.publish_tokens_file.as_deref())?;
+    let uploads = build_upload_store(args.data_dir.clone(), publish_tokens)?;
 
     // Either the operator pointed us at a persistent volume (Fly.io
     // / mounted PV / whatever) or we spin up a tempdir that lives
@@ -350,13 +410,20 @@ async fn serve(args: ServeArgs) -> Result<()> {
     };
     let source_cache = Arc::new(SourceCache::new(cache_base, cache_tempdir)?);
 
-    let initial = refresh_index_and_cache(&args.index, &source_aliases, &source_cache).await?;
+    let initial = refresh_index_and_cache(
+        &args.index,
+        &source_aliases,
+        &source_cache,
+        uploads.as_deref(),
+    )
+    .await?;
     let state = AppState {
         state: Arc::new(RwLock::new(initial)),
         index_path: args.index,
         skills_root: args.skills_root,
         name: args.name,
         source_aliases,
+        uploads,
     };
 
     if args.refresh_interval_seconds > 0 {
@@ -365,6 +432,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
             state.index_path.clone(),
             state.source_aliases.clone(),
             source_cache,
+            state.uploads.clone(),
             Duration::from_secs(args.refresh_interval_seconds),
         );
     }
@@ -387,6 +455,14 @@ async fn serve(args: ServeArgs) -> Result<()> {
         // namespaced entry matches the bare name, 409 with a
         // disambiguation hint when several do, 404 otherwise.
         .route("/skills/{name}/archive", get(skill_archive_legacy))
+        // Publish endpoint. Accepts the exact tarball `knack pack`
+        // produces. Returns 403 until the operator opts in with
+        // --data-dir + a publish token; this is the live server's
+        // key capability over a static snapshot.
+        .route("/skills/{namespace}/{name}", put(publish))
+        // Raise axum's 2 MB default body cap for skill uploads. GET
+        // routes carry no body, so the wider limit is inert there.
+        .layer(DefaultBodyLimit::max(args.publish_max_bytes))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(args.bind)
@@ -399,6 +475,64 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .context("registry server failed")?;
 
     Ok(())
+}
+
+/// Merge `--publish-token` flags with the lines of `--publish-tokens-file`.
+/// Blank lines and `#` comments in the file are skipped so it can be a
+/// plain hand-maintained list.
+fn load_publish_tokens(flags: &[String], file: Option<&Path>) -> Result<Vec<String>> {
+    let mut tokens: Vec<String> = flags.to_vec();
+    if let Some(path) = file {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read publish tokens file {}", path.display()))?;
+        tokens.extend(
+            contents
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(String::from),
+        );
+    }
+    if tokens.iter().any(|token| token.is_empty()) {
+        bail!("publish tokens must not be empty strings");
+    }
+    Ok(tokens)
+}
+
+/// Publishing requires both a place to keep uploads and a way to
+/// authorise them; enabling one without the other is always operator
+/// error, so fail loudly at startup instead of serving a half-open
+/// (or silently disabled) endpoint.
+fn build_upload_store(
+    data_dir: Option<PathBuf>,
+    tokens: Vec<String>,
+) -> Result<Option<Arc<UploadStore>>> {
+    match (data_dir, tokens.is_empty()) {
+        (Some(dir), false) => {
+            let root = dir.join("skills");
+            std::fs::create_dir_all(&root)
+                .with_context(|| format!("failed to create upload dir {}", root.display()))?;
+            Ok(Some(Arc::new(UploadStore {
+                cached: Arc::new(CachedSource {
+                    repo_dir: root.clone(),
+                    sha: tokio::sync::RwLock::new(None),
+                    refresh_lock: tokio::sync::RwLock::new(()),
+                }),
+                root,
+                tokens,
+            })))
+        }
+        (Some(_), true) => bail!(
+            "--data-dir requires at least one publish token \
+             (--publish-token or --publish-tokens-file); refusing to \
+             enable unauthenticated publishing"
+        ),
+        (None, false) => bail!(
+            "--publish-token/--publish-tokens-file require --data-dir \
+             so published skills have somewhere persistent to live"
+        ),
+        (None, true) => Ok(None),
+    }
 }
 
 /// One-shot materialise: clone all backing sources into a tempdir,
@@ -422,7 +556,7 @@ async fn build_static(args: BuildStaticArgs) -> Result<()> {
     )?);
 
     eprintln!("materialising index from {}...", args.index.display());
-    let indexed = refresh_index_and_cache(&args.index, &source_aliases, &cache).await?;
+    let indexed = refresh_index_and_cache(&args.index, &source_aliases, &cache, None).await?;
     eprintln!(
         "materialised {} skill(s) from {} [[source]] entry(ies)",
         indexed.locations.len(),
@@ -450,6 +584,9 @@ async fn build_static(args: BuildStaticArgs) -> Result<()> {
     let info = RegistryInfo {
         name: args.name.clone(),
         version: env!("CARGO_PKG_VERSION"),
+        // A static snapshot has no write path by definition — that's
+        // the live server's differentiator.
+        publish: false,
     };
     let info_path = args.output.join("info.json");
     std::fs::write(&info_path, serde_json::to_string_pretty(&info)?)
@@ -543,6 +680,7 @@ async fn refresh_index_and_cache(
     path: &Path,
     source_aliases: &BTreeMap<String, String>,
     cache: &SourceCache,
+    uploads: Option<&UploadStore>,
 ) -> Result<IndexedState> {
     let mut index = read_index(path)?;
     // Keyed by qualified_name (`<namespace>/<name>` when scoped, bare
@@ -596,6 +734,7 @@ async fn refresh_index_and_cache(
             SkillLocation {
                 cached: cached.clone(),
                 relative,
+                from_upload: false,
             },
         );
     }
@@ -690,6 +829,7 @@ async fn refresh_index_and_cache(
                 SkillLocation {
                     cached: cached.clone(),
                     relative: relative_to_repo,
+                    from_upload: false,
                 },
             );
             index.skill.push(IndexedSkill {
@@ -702,6 +842,14 @@ async fn refresh_index_and_cache(
             });
         }
     }
+    // Uploaded skills come last: git-backed sources are declared in
+    // the operator-managed index TOML and win any (namespace, name)
+    // collision, same first-wins rule that already orders static
+    // entries above dynamic ones. Deterministic and debuggable.
+    if let Some(uploads) = uploads {
+        collect_uploaded_skills(uploads, &mut index, &mut locations).await;
+    }
+
     index.skill.sort_by_key(|skill| skill.qualified_name());
     index.validate()?;
 
@@ -712,11 +860,129 @@ async fn refresh_index_and_cache(
     Ok(IndexedState { index, locations })
 }
 
+/// Walk `<data-dir>/skills/<namespace>/<name>/` and fold every valid
+/// uploaded skill into the index being built. Malformed entries are
+/// warn-and-skip, mirroring how dynamic sources tolerate one bad
+/// skill without taking the whole refresh down. Holds the upload
+/// store's read lock so a concurrent publish can't swap a directory
+/// out from under the walk.
+async fn collect_uploaded_skills(
+    uploads: &UploadStore,
+    index: &mut RegistryIndex,
+    locations: &mut HashMap<String, SkillLocation>,
+) {
+    let _read_guard = uploads.cached.refresh_lock.read().await;
+    let namespace_dirs = match sorted_child_dirs(&uploads.root) {
+        Ok(dirs) => dirs,
+        Err(err) => {
+            eprintln!(
+                "failed to walk upload dir {}: {err:#}",
+                uploads.root.display()
+            );
+            return;
+        }
+    };
+    for namespace_dir in namespace_dirs {
+        let Some(namespace) = namespace_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(String::from)
+        else {
+            continue;
+        };
+        // Dot-prefixed entries are in-flight publish tempdirs
+        // (tempfile's `.tmp*`); everything else must be a valid
+        // namespace or it never came from the publish endpoint.
+        if namespace.starts_with('.') {
+            continue;
+        }
+        if let Err(err) = validate_skill_name(&namespace) {
+            eprintln!(
+                "skipping uploaded namespace dir {}: {err:#}",
+                namespace_dir.display()
+            );
+            continue;
+        }
+        let skill_dirs = match sorted_child_dirs(&namespace_dir) {
+            Ok(dirs) => dirs,
+            Err(err) => {
+                eprintln!("failed to walk {}: {err:#}", namespace_dir.display());
+                continue;
+            }
+        };
+        for skill_dir in skill_dirs {
+            let skill = match read_skill(&skill_dir) {
+                Ok(skill) => skill,
+                Err(err) => {
+                    eprintln!(
+                        "skipping uploaded skill {}: failed to read SKILL.md: {err:#}",
+                        skill_dir.display()
+                    );
+                    continue;
+                }
+            };
+            // Strict validation (dir name == frontmatter name): the
+            // publish endpoint enforces it on the way in, so any
+            // mismatch here means the store was edited by hand.
+            if let Err(err) = validate_skill(&skill) {
+                eprintln!("skipping uploaded skill {}: {err:#}", skill_dir.display());
+                continue;
+            }
+            let qualified = format!("{namespace}/{}", skill.name);
+            if locations.contains_key(&qualified) {
+                eprintln!(
+                    "warn: skipped uploaded skill `{qualified}` \
+                     (already provided by a git-backed source)"
+                );
+                continue;
+            }
+            locations.insert(
+                qualified.clone(),
+                SkillLocation {
+                    cached: uploads.cached.clone(),
+                    relative: Path::new(&namespace).join(&skill.name),
+                    from_upload: true,
+                },
+            );
+            index.skill.push(IndexedSkill {
+                name: skill.name,
+                namespace: Some(namespace.clone()),
+                description: skill.description,
+                // Uploads have no backing URL; the install-command
+                // suffix is the natural source identity, matching the
+                // rewrite /search performs for named registries.
+                source: qualified,
+                tags: Vec::new(),
+                score: None,
+            });
+        }
+    }
+}
+
+/// Immediate child directories of `path`, sorted for deterministic
+/// walk order across refreshes.
+fn sorted_child_dirs(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(path)
+        .with_context(|| format!("failed to read {}", path.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.path())
+        .collect();
+    dirs.sort();
+    Ok(dirs)
+}
+
 fn spawn_refresh_task(
     state: Arc<RwLock<IndexedState>>,
     index_path: PathBuf,
     source_aliases: BTreeMap<String, String>,
     cache: Arc<SourceCache>,
+    uploads: Option<Arc<UploadStore>>,
     interval: Duration,
 ) {
     tokio::spawn(async move {
@@ -724,7 +990,9 @@ fn spawn_refresh_task(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            match refresh_index_and_cache(&index_path, &source_aliases, &cache).await {
+            match refresh_index_and_cache(&index_path, &source_aliases, &cache, uploads.as_deref())
+                .await
+            {
                 Ok(refreshed) => {
                     let mut guard = state.write().await;
                     *guard = refreshed;
@@ -779,6 +1047,7 @@ async fn info(State(state): State<AppState>) -> Json<RegistryInfo> {
     Json(RegistryInfo {
         name: state.name.clone(),
         version: env!("CARGO_PKG_VERSION"),
+        publish: state.uploads.is_some(),
     })
 }
 
@@ -984,27 +1253,231 @@ async fn create_skill_archive(
     })
 }
 
-fn create_skill_archive_from_dir(skill_dir: &Path) -> Result<Vec<u8>> {
-    let skill = read_skill(skill_dir)?;
-    validate_skill_metadata(&skill)?;
+/// Publish endpoint: `PUT /skills/{namespace}/{name}` with a
+/// `knack pack` tarball as the body. This is the live server's
+/// differentiator over a static snapshot: skills land here directly,
+/// without having to pass through a git repository first.
+///
+/// Disabled (403) unless the operator opted in with --data-dir plus a
+/// publish token. Authenticated uploads are validated (well-formed
+/// archive, valid SKILL.md, names agree), stored under
+/// `<data-dir>/skills/<namespace>/<name>/`, and folded into the live
+/// index immediately — no waiting for the next background refresh.
+async fn publish(
+    State(state): State<AppState>,
+    AxumPath((namespace, name)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(uploads) = state.uploads.clone() else {
+        return (
+            StatusCode::FORBIDDEN,
+            "publishing is not enabled on this registry; the operator must \
+             start knack-registry with --data-dir and --publish-token",
+        )
+            .into_response();
+    };
+    match bearer_token(&headers) {
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "publishing requires an `Authorization: Bearer <token>` header",
+            )
+                .into_response();
+        }
+        Some(token) if !token_authorised(token, &uploads.tokens) => {
+            return (StatusCode::FORBIDDEN, "publish token not recognised").into_response();
+        }
+        Some(_) => {}
+    }
+    if validate_skill_name(&namespace).is_err() || validate_skill_name(&name).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "namespace and name must be kebab-case identifiers",
+        )
+            .into_response();
+    }
+    let qualified = format!("{namespace}/{name}");
 
-    let buffer = Vec::new();
-    let encoder = GzEncoder::new(buffer, Compression::default());
-    let mut archive = Builder::new(encoder);
-    for file in collect_files(skill_dir)? {
-        let relative = file.strip_prefix(skill_dir).with_context(|| {
-            format!(
-                "failed to make {} relative to {}",
-                file.display(),
-                skill_dir.display()
+    // Refuse to shadow a git-backed skill. Those are declared in the
+    // operator-managed index TOML; an upload silently masking one
+    // would be undebuggable. Re-publishing over a previous upload is
+    // the normal update flow and sails through.
+    {
+        let guard = state.state.read().await;
+        if let Some(existing) = guard.locations.get(&qualified) {
+            if !existing.from_upload {
+                return (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "skill `{qualified}` is provided by a git-backed source in the \
+                         registry index; publish through that repository (or remove the \
+                         index entry) instead"
+                    ),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let accepted = match accept_upload(&uploads, &namespace, &name, &body).await {
+        Ok(accepted) => accepted,
+        Err((status, message)) => return (status, message).into_response(),
+    };
+
+    // Fold the skill into the live index immediately so /search,
+    // /index, and archive requests see it without waiting for the
+    // next refresh tick. A refresh pass that raced this publish may
+    // briefly clobber the entry with its pre-publish snapshot; the
+    // skill is already durable on disk, so the following pass walks
+    // it right back in — eventual consistency bounded by the refresh
+    // interval.
+    {
+        let mut guard = state.state.write().await;
+        guard.locations.insert(
+            qualified.clone(),
+            SkillLocation {
+                cached: uploads.cached.clone(),
+                relative: Path::new(&namespace).join(&name),
+                from_upload: true,
+            },
+        );
+        guard
+            .index
+            .skill
+            .retain(|skill| skill.qualified_name() != qualified);
+        guard.index.skill.push(IndexedSkill {
+            name: name.clone(),
+            namespace: Some(namespace.clone()),
+            description: accepted.description,
+            source: qualified,
+            tags: Vec::new(),
+            score: None,
+        });
+        guard
+            .index
+            .skill
+            .sort_by_key(|skill| skill.qualified_name());
+    }
+
+    let status = if accepted.replaced {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "name": name,
+            "namespace": namespace,
+            "checksum": accepted.checksum,
+            "replaced": accepted.replaced,
+        })),
+    )
+        .into_response()
+}
+
+struct AcceptedUpload {
+    description: String,
+    checksum: String,
+    replaced: bool,
+}
+
+/// Validate and store an uploaded skill archive. Unpacks into a
+/// tempdir *inside the upload root* so the final rename is
+/// same-filesystem, validates the skill (shape, SKILL.md, names
+/// agree), then swaps it into `<root>/<namespace>/<name>/` under the
+/// store's write lock — the same lock archive reads and refresh walks
+/// take as readers, so nobody observes a half-moved directory.
+async fn accept_upload(
+    uploads: &UploadStore,
+    namespace: &str,
+    name: &str,
+    body: &[u8],
+) -> Result<AcceptedUpload, (StatusCode, String)> {
+    fn internal(context: &str, err: impl std::fmt::Display) -> (StatusCode, String) {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{context}: {err}"),
+        )
+    }
+    let staging = tempfile::tempdir_in(&uploads.root)
+        .map_err(|err| internal("failed to create staging dir", err))?;
+    let skill_root =
+        unpack_skill_archive(std::io::Cursor::new(body), staging.path()).map_err(|err| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid skill archive: {err:#}"),
             )
         })?;
-        let archive_name = Path::new(&skill.name).join(relative);
-        append_file(&mut archive, &file, &archive_name)?;
+    let skill = read_skill(&skill_root).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid skill archive: {err:#}"),
+        )
+    })?;
+    validate_skill(&skill).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid skill archive: {err:#}"),
+        )
+    })?;
+    if skill.name != name {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "archive contains skill `{}` but the request URL names `{name}`; \
+                 re-pack the skill or fix the URL",
+                skill.name
+            ),
+        ));
     }
-    archive.finish()?;
-    let encoder = archive.into_inner()?;
-    Ok(encoder.finish()?)
+
+    let _write_guard = uploads.cached.refresh_lock.write().await;
+    let namespace_dir = uploads.root.join(namespace);
+    std::fs::create_dir_all(&namespace_dir)
+        .map_err(|err| internal("failed to create namespace dir", err))?;
+    let destination = namespace_dir.join(name);
+    let replaced = destination.exists();
+    if replaced {
+        std::fs::remove_dir_all(&destination)
+            .map_err(|err| internal("failed to replace previous upload", err))?;
+    }
+    std::fs::rename(&skill_root, &destination)
+        .map_err(|err| internal("failed to store uploaded skill", err))?;
+    let checksum = checksum_dir(&destination)
+        .map_err(|err| internal("failed to checksum upload", format!("{err:#}")))?;
+
+    Ok(AcceptedUpload {
+        description: skill.description,
+        checksum,
+        replaced,
+    })
+}
+
+/// Extract the token from an `Authorization: Bearer <token>` header.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+fn token_authorised(provided: &str, tokens: &[String]) -> bool {
+    tokens
+        .iter()
+        .any(|token| constant_time_eq(token.as_bytes(), provided.as_bytes()))
+}
+
+/// Timing-safe byte comparison so token checks don't leak how many
+/// leading bytes matched. Length is still observable, which is fine —
+/// token length isn't the secret.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Decomposed backing-source URL: where to clone from, which ref to
@@ -1405,34 +1878,6 @@ fn parse_source_aliases(values: &[String]) -> Result<BTreeMap<String, String>> {
         aliases.insert(name.to_string(), url.to_string());
     }
     Ok(aliases)
-}
-
-fn append_file(
-    archive: &mut Builder<GzEncoder<Vec<u8>>>,
-    source: &Path,
-    archive_name: &Path,
-) -> Result<()> {
-    let mut file =
-        File::open(source).with_context(|| format!("failed to open {}", source.display()))?;
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("failed to stat {}", source.display()))?;
-    if !metadata.is_file() {
-        bail!("not a file: {}", source.display());
-    }
-
-    let mut header = Header::new_gnu();
-    header.set_size(metadata.len());
-    header.set_mode(0o644);
-    header.set_mtime(0);
-    header.set_uid(0);
-    header.set_gid(0);
-    header.set_cksum();
-
-    archive
-        .append_data(&mut header, archive_name, &mut file)
-        .with_context(|| format!("failed to archive {}", source.display()))?;
-    Ok(())
 }
 
 async fn shutdown_signal() {
