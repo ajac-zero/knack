@@ -374,12 +374,34 @@ knack-registry \
 
 `KNACK_DATABASE_URL` (or `--database-url`) stores published metadata and archive bytes transactionally in Postgres. All replicas query the shared database for index, search, and archive requests, so a publish accepted by one replica is immediately available through every other replica. The registry creates its `knack_published_skills` table on startup.
 
+For self-service human publishing with attribution, configure OpenID Connect once for the registry instead of issuing per-user registry tokens:
+
+```bash
+KNACK_DATABASE_URL=postgres://knack:secret@postgres/knack \
+KNACK_OIDC_ISSUER=https://login.example.com/realms/company \
+KNACK_OIDC_AUDIENCE=https://skills.example.com \
+KNACK_OIDC_CLIENT_ID=knack-cli \
+knack-registry --name company --bind 0.0.0.0:7349
+```
+
+The provider must issue RS256 JWT access tokens for the configured audience. By default, any authenticated identity able to obtain such a token may publish to its own namespace. If browsing and publishing need separate authorization, set `KNACK_OIDC_REQUIRED_SCOPE=knack:publish`; the registry then requests and validates that scope. Users sign in through the standard authorization-code flow with PKCE:
+
+```bash
+knack auth login --registry company
+knack publish ./my-skill --registry company
+```
+
+The registry derives a personal namespace from the authenticated identity's `preferred_username` claim and claims it transactionally on first publish. No administrator provisioning is needed. The stable ownership key is the token's `(issuer, subject)` pair, so a later username change does not move the namespace. Name collisions receive a deterministic suffix. Published entries expose the authenticated publisher and timestamps in `/index` and `/search`, and every OIDC publish appends an audit event in Postgres.
+
+OIDC publishing deliberately requires Postgres: identity-to-namespace assignments and attribution must be consistent across replicas and restarts. The CLI stores OAuth credentials in `~/.agents/knack-credentials.toml` with mode `0600` on Unix. `knack auth logout --registry company` removes them.
+
 No index file is required for a Postgres-only registry. Pass `--index knack.index.toml` if you also want to merge operator-managed Git sources into the same registry. In that hybrid mode, run each replica with the same index and source aliases; `--cache-dir` remains per-replica, rebuildable Git cache and does not need to be shared. Without Postgres, an omitted `--index` retains the existing default of `knack.index.toml`.
 
 Notes:
 
 - Publishing stays disabled unless a token is configured with either `--data-dir` (single node) or `--database-url` (multiple replicas); without them the server is read-only, the same surface a static snapshot offers. The two storage options are mutually exclusive.
 - `--publish-token` is repeatable (one per team, or old+new during rotation); `--publish-tokens-file` reads one token per line for setups where the process list is visible.
+- Publish tokens are service credentials for trusted automation. They still require an explicit `--namespace` and are not represented as human attribution. Human self-service publishing requires OIDC and omits `--namespace`.
 - Uploads must be namespaced. A publish that would shadow a skill provided by a git-backed `[[skill]]`/`[[source]]` entry is rejected with 409 — the operator-managed index always wins.
 - Re-publishing the same `namespace/name` replaces the previous upload (latest-only; no version history yet).
 - Uploaded archives have no git provenance, so there's no `X-Knack-Resolved-Sha`; clients fall back to checksum-based change detection in the lockfile.
@@ -453,13 +475,12 @@ knack add tea:platform/agent-skills/skills/my-skill
 **HTTP registries** — the skill is uploaded straight to a live `knack-registry` with publishing enabled (see [Direct publishing](#direct-publishing-live-registry-only)), no git repository involved:
 
 ```bash
+knack auth login --registry company
 knack publish ./my-skill \
-  --registry company \
-  --namespace platform-team \
-  --token "$TOKEN"          # or set KNACK_PUBLISH_TOKEN
+  --registry company
 ```
 
-The skill is packed, validated, and uploaded; teammates install it as `knack add company:platform-team/my-skill` immediately. Static registry snapshots and registries started without `--data-dir`/`--publish-token` reject publishes with an actionable error.
+The skill is packed, validated, attributed to the authenticated OIDC identity, and uploaded under the user's automatically assigned personal namespace. The successful response prints the exact `knack add company:<namespace>/my-skill` command. For trusted automation, continue to pass `--namespace platform-team --token "$TOKEN"` (or set `KNACK_PUBLISH_TOKEN`). Static registry snapshots reject publishes with an actionable error.
 
 List installed skills:
 

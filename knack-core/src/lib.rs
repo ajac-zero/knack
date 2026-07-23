@@ -377,6 +377,18 @@ pub struct IndexedSkill {
     #[serde(default)]
     pub tags: Vec<String>,
 
+    /// Authenticated principal that published a direct upload. Git-backed
+    /// entries omit this because their provenance remains the backing Git
+    /// repository and commit history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+
     /// Relevance score assigned by `RegistryIndex::search`. Only ever
     /// set on results returned from a search — never persisted in
     /// `knack.index.toml` and never present on entries read from
@@ -756,6 +768,9 @@ mod tests {
                     description: "Work with PDF documents".to_string(),
                     source: "anthropics/pdf".to_string(),
                     tags: vec!["documents".to_string(), "ocr".to_string()],
+                    publisher: None,
+                    published_at: None,
+                    updated_at: None,
                     score: None,
                 },
                 IndexedSkill {
@@ -764,6 +779,9 @@ mod tests {
                     description: "Review Rust code".to_string(),
                     source: "rust-code-review".to_string(),
                     tags: vec!["rust".to_string()],
+                    publisher: None,
+                    published_at: None,
+                    updated_at: None,
                     score: None,
                 },
             ],
@@ -794,6 +812,9 @@ mod tests {
                         .to_string(),
                     source: "changelog-writer".to_string(),
                     tags: vec![],
+                    publisher: None,
+                    published_at: None,
+                    updated_at: None,
                     score: None,
                 },
                 IndexedSkill {
@@ -802,6 +823,9 @@ mod tests {
                     description: "Review code for correctness".to_string(),
                     source: "rust-code-review".to_string(),
                     tags: vec!["rust".to_string()],
+                    publisher: None,
+                    published_at: None,
+                    updated_at: None,
                     score: None,
                 },
             ],
@@ -834,6 +858,9 @@ mod tests {
                 description: "Helps deploy your pipeline safely.".to_string(),
                 source: "ci-tools".to_string(),
                 tags: vec!["ci".to_string()],
+                publisher: None,
+                published_at: None,
+                updated_at: None,
                 score: None,
             },
             IndexedSkill {
@@ -842,6 +869,9 @@ mod tests {
                 description: "Also handles some ci related tasks.".to_string(),
                 source: "deploy".to_string(),
                 tags: vec!["deploy".to_string()],
+                publisher: None,
+                published_at: None,
+                updated_at: None,
                 score: None,
             },
         ];
@@ -855,6 +885,9 @@ mod tests {
                 description: "Handles deployment automation for unrelated workflows.".to_string(),
                 source: format!("filler-{i}"),
                 tags: vec![],
+                publisher: None,
+                published_at: None,
+                updated_at: None,
                 score: None,
             });
         }
@@ -884,6 +917,9 @@ mod tests {
                 description: "Work with PDF documents".to_string(),
                 source: "anthropics/pdf".to_string(),
                 tags: vec!["documents".to_string()],
+                publisher: None,
+                published_at: None,
+                updated_at: None,
                 score: None,
             }],
             source: Vec::new(),
@@ -903,6 +939,9 @@ mod tests {
                     description: "docs helper".to_string(),
                     source: "zeta".to_string(),
                     tags: vec![],
+                    publisher: None,
+                    published_at: None,
+                    updated_at: None,
                     score: None,
                 },
                 IndexedSkill {
@@ -911,6 +950,9 @@ mod tests {
                     description: "docs helper".to_string(),
                     source: "alpha".to_string(),
                     tags: vec![],
+                    publisher: None,
+                    published_at: None,
+                    updated_at: None,
                     score: None,
                 },
             ],
@@ -930,6 +972,9 @@ mod tests {
             description: "x".to_string(),
             source: "anthropics/pdf".to_string(),
             tags: vec![],
+            publisher: None,
+            published_at: None,
+            updated_at: None,
             score: None,
         };
         assert_eq!(scoped.qualified_name(), "anthropics/pdf");
@@ -940,6 +985,9 @@ mod tests {
             description: "x".to_string(),
             source: "legacy".to_string(),
             tags: vec![],
+            publisher: None,
+            published_at: None,
+            updated_at: None,
             score: None,
         };
         assert_eq!(unscoped.qualified_name(), "legacy");
@@ -954,6 +1002,9 @@ mod tests {
             description: "x".to_string(),
             source: "good-ns/ok".to_string(),
             tags: vec![],
+            publisher: None,
+            published_at: None,
+            updated_at: None,
             score: None,
         };
         assert!(skill.validate().is_ok());
@@ -1062,6 +1113,9 @@ checksum = "x"
             description: "x".to_string(),
             source: "legacy".to_string(),
             tags: vec![],
+            publisher: None,
+            published_at: None,
+            updated_at: None,
             score: None,
         };
         let json = serde_json::to_string(&skill).unwrap();
