@@ -362,9 +362,23 @@ knack-registry \
 
 This enables `PUT /skills/{namespace}/{name}`, authenticated with `Authorization: Bearer <token>`, accepting the exact tarball `knack pack` produces. Uploaded skills are stored under `<data-dir>/skills/<namespace>/<name>/`, folded into the index immediately, and re-indexed from disk on every refresh and restart — put `--data-dir` on a persistent volume. Unlike `--cache-dir` (rebuildable scratch), the data directory holds canonical data.
 
+For a horizontally scaled deployment, use Postgres instead of a local data directory:
+
+```bash
+KNACK_DATABASE_URL=postgres://knack:secret@postgres/knack \
+knack-registry \
+  --name company \
+  --publish-token "$TOKEN" \
+  --bind 0.0.0.0:7349
+```
+
+`KNACK_DATABASE_URL` (or `--database-url`) stores published metadata and archive bytes transactionally in Postgres. All replicas query the shared database for index, search, and archive requests, so a publish accepted by one replica is immediately available through every other replica. The registry creates its `knack_published_skills` table on startup.
+
+No index file is required for a Postgres-only registry. Pass `--index knack.index.toml` if you also want to merge operator-managed Git sources into the same registry. In that hybrid mode, run each replica with the same index and source aliases; `--cache-dir` remains per-replica, rebuildable Git cache and does not need to be shared. Without Postgres, an omitted `--index` retains the existing default of `knack.index.toml`.
+
 Notes:
 
-- Publishing stays disabled unless **both** `--data-dir` and a token are configured; without them the server is read-only, the same surface a static snapshot offers.
+- Publishing stays disabled unless a token is configured with either `--data-dir` (single node) or `--database-url` (multiple replicas); without them the server is read-only, the same surface a static snapshot offers. The two storage options are mutually exclusive.
 - `--publish-token` is repeatable (one per team, or old+new during rotation); `--publish-tokens-file` reads one token per line for setups where the process list is visible.
 - Uploads must be namespaced. A publish that would shadow a skill provided by a git-backed `[[skill]]`/`[[source]]` entry is rejected with 409 — the operator-managed index always wins.
 - Re-publishing the same `namespace/name` replaces the previous upload (latest-only; no version history yet).
