@@ -108,6 +108,22 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run the knack Model Context Protocol server over stdio.
+    ///
+    /// Exposes tools for finding, adding, and publishing skills so an agent
+    /// can manage skills using the same configuration and credentials as the
+    /// CLI. Configure an MCP client to launch `knack mcp`.
+    Mcp {
+        /// Comma-delimited allowlist of tools to expose. Defaults to all tools.
+        /// Valid values: find_skills, add_skill, publish_skill.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "find_skills,add_skill,publish_skill"
+        )]
+        tools: Vec<McpTool>,
+    },
+
     /// Create a knack.toml manifest.
     Init {
         /// Path where the manifest should be written.
@@ -945,6 +961,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Mcp { tools } => run_mcp_server(&tools)?,
         Command::Init {
             manifest,
             target,
@@ -1057,6 +1074,310 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct McpRequest {
+    #[serde(default)]
+    id: Option<serde_json::Value>,
+    method: String,
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum McpTool {
+    FindSkills,
+    AddSkill,
+    PublishSkill,
+}
+
+impl McpTool {
+    fn name(self) -> &'static str {
+        match self {
+            Self::FindSkills => "find_skills",
+            Self::AddSkill => "add_skill",
+            Self::PublishSkill => "publish_skill",
+        }
+    }
+}
+
+fn run_mcp_server(tools: &[McpTool]) -> Result<()> {
+    use std::io::BufRead;
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout().lock();
+    for line in stdin.lock().lines() {
+        let line = line.context("failed to read MCP request")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let request: McpRequest = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(err) => {
+                write_mcp_message(
+                    &mut stdout,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": { "code": -32700, "message": format!("Parse error: {err}") }
+                    }),
+                )?;
+                continue;
+            }
+        };
+
+        let Some(id) = request.id else {
+            continue;
+        };
+        let response = match request.method.as_str() {
+            "initialize" => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": negotiate_mcp_version(&request.params),
+                    "capabilities": { "tools": {} },
+                    "serverInfo": {
+                        "name": "knack",
+                        "title": "knack Agent Skills",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "instructions": "Find relevant Agent Skills before starting specialized work. Add a skill when it will help with the user's task. Publish only when the user explicitly asks to share a local skill."
+                }
+            }),
+            "ping" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+            "tools/list" => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "tools": mcp_tools(tools) }
+            }),
+            "tools/call" => match call_mcp_tool(&request.params, tools) {
+                Ok(result) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                Err(err) => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32602, "message": err.to_string() }
+                }),
+            },
+            _ => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": "Method not found" }
+            }),
+        };
+        write_mcp_message(&mut stdout, &response)?;
+    }
+    Ok(())
+}
+
+fn write_mcp_message(writer: &mut impl Write, message: &serde_json::Value) -> Result<()> {
+    serde_json::to_writer(&mut *writer, message).context("failed to serialize MCP response")?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn negotiate_mcp_version(params: &serde_json::Value) -> &str {
+    match params
+        .get("protocolVersion")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("2024-11-05") => "2024-11-05",
+        Some("2025-03-26") => "2025-03-26",
+        Some("2025-06-18") => "2025-06-18",
+        _ => "2025-06-18",
+    }
+}
+
+fn mcp_tools(enabled: &[McpTool]) -> serde_json::Value {
+    let tools = serde_json::json!([
+        {
+            "name": "find_skills",
+            "title": "Find Agent Skills",
+            "description": "Search all configured knack HTTP registries for Agent Skills relevant to a user's task. Returns ranked skill names and descriptions; use an exact returned name with add_skill.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "The user's task or capability to search for." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true }
+        },
+        {
+            "name": "add_skill",
+            "title": "Add Agent Skill",
+            "description": "Install a skill and record it in the current project's knack manifest and lockfile. Set global=true only when the user wants the skill available across projects.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "A skill returned by find_skills, or another knack source such as gh:owner/repo/path." },
+                    "global": { "type": "boolean", "default": false }
+                },
+                "required": ["source"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true }
+        },
+        {
+            "name": "publish_skill",
+            "title": "Publish Agent Skill",
+            "description": "Validate and publish a local Agent Skill to a configured knack registry. HTTP registries use existing knack login credentials; service-token publishing reads KNACK_PUBLISH_TOKEN and requires namespace. Git-host registries require repo.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to the local skill directory." },
+                    "registry": { "type": "string", "description": "Configured registry alias." },
+                    "namespace": { "type": "string", "description": "Namespace required when KNACK_PUBLISH_TOKEN is used." },
+                    "repo": { "type": "string", "description": "Target owner/repo required for a git-host registry." },
+                    "global": { "type": "boolean", "default": false }
+                },
+                "required": ["path", "registry"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true }
+        }
+    ]);
+    serde_json::Value::Array(
+        tools
+            .as_array()
+            .expect("MCP tools are an array")
+            .iter()
+            .filter(|tool| {
+                let name = tool["name"].as_str().expect("MCP tool has a name");
+                enabled.iter().any(|enabled| enabled.name() == name)
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+fn call_mcp_tool(params: &serde_json::Value, enabled: &[McpTool]) -> Result<serde_json::Value> {
+    let name = params
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("missing tool name"))?;
+    if !enabled.iter().any(|tool| tool.name() == name) {
+        bail!("unknown or disabled tool: {name}");
+    }
+    let arguments = params
+        .get("arguments")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+    let mut args = Vec::new();
+    match name {
+        "find_skills" => {
+            validate_mcp_arguments(arguments, &["query", "limit"])?;
+            args.push("find".to_string());
+            args.push(mcp_string_argument(arguments, "query")?.to_string());
+            if let Some(limit) = arguments.get("limit") {
+                let limit = limit
+                    .as_u64()
+                    .filter(|limit| (1..=100).contains(limit))
+                    .ok_or_else(|| anyhow!("limit must be an integer from 1 to 100"))?;
+                args.extend(["--limit".to_string(), limit.to_string()]);
+            }
+        }
+        "add_skill" => {
+            validate_mcp_arguments(arguments, &["source", "global"])?;
+            args.push("add".to_string());
+            args.push(mcp_string_argument(arguments, "source")?.to_string());
+            if mcp_bool_argument(arguments, "global")? {
+                args.push("--global".to_string());
+            }
+        }
+        "publish_skill" => {
+            validate_mcp_arguments(
+                arguments,
+                &["path", "registry", "namespace", "repo", "global"],
+            )?;
+            args.push("publish".to_string());
+            args.push(mcp_string_argument(arguments, "path")?.to_string());
+            args.extend([
+                "--registry".to_string(),
+                mcp_string_argument(arguments, "registry")?.to_string(),
+            ]);
+            for field in ["namespace", "repo"] {
+                if let Some(value) = arguments.get(field) {
+                    let value = value
+                        .as_str()
+                        .filter(|value| !value.trim().is_empty())
+                        .ok_or_else(|| anyhow!("{field} must be a non-empty string"))?;
+                    args.extend([format!("--{field}"), value.to_string()]);
+                }
+            }
+            if mcp_bool_argument(arguments, "global")? {
+                args.push("--global".to_string());
+            }
+        }
+        _ => bail!("unknown tool: {name}"),
+    }
+
+    let executable = std::env::current_exe().context("failed to locate knack executable")?;
+    let output = ProcessCommand::new(executable)
+        .args(args)
+        .env("NO_COLOR", "1")
+        .output()
+        .with_context(|| format!("failed to run {name}"))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(stderr.trim());
+    }
+    if text.is_empty() {
+        text = if output.status.success() {
+            "Tool completed successfully.".to_string()
+        } else {
+            format!("Tool failed with status {}.", output.status)
+        };
+    }
+    Ok(serde_json::json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": !output.status.success()
+    }))
+}
+
+fn validate_mcp_arguments(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+) -> Result<()> {
+    if let Some(name) = arguments
+        .keys()
+        .find(|name| !allowed.contains(&name.as_str()))
+    {
+        bail!("unknown argument: {name}");
+    }
+    Ok(())
+}
+
+fn mcp_string_argument<'a>(
+    arguments: &'a serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Result<&'a str> {
+    arguments
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("{name} must be a non-empty string"))
+}
+
+fn mcp_bool_argument(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Result<bool> {
+    match arguments.get(name) {
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| anyhow!("{name} must be a boolean")),
+        None => Ok(false),
+    }
 }
 
 fn handle_auth_command(command: AuthCommand) -> Result<()> {

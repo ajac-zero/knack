@@ -38,6 +38,54 @@ Verify the install:
 knack --help
 ```
 
+## MCP server
+
+`knack` includes a stdio [Model Context Protocol](https://modelcontextprotocol.io/)
+server so agents can discover and manage skills on a user's behalf. Configure your MCP
+client to launch:
+
+```bash
+knack mcp
+```
+
+For clients that use JSON configuration, the entry typically looks like:
+
+```json
+{
+  "mcpServers": {
+    "knack": {
+      "command": "knack",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+The server exposes three tools:
+
+- `find_skills` searches configured HTTP registries and returns ranked matches.
+- `add_skill` installs a source and updates the project (or global) manifest and lockfile.
+- `publish_skill` validates and publishes a local skill to a configured registry.
+
+All three are enabled by default. Use `--tools` as an explicit allowlist when an MCP
+client should have fewer capabilities. For example, a static registry deployment can
+expose only discovery and installation:
+
+```bash
+knack mcp --tools find_skills,add_skill
+```
+
+The valid values are `find_skills`, `add_skill`, and `publish_skill`. This is an MCP
+server policy rather than automatic registry detection: knack can search several
+registries at once, registry availability can change after startup, and operators may
+want to hide a mutating tool even when the backing registry supports it.
+
+The MCP process inherits its working directory and environment from the client. Project
+installs therefore apply to that working directory, while `global: true` uses
+`~/.agents/`. Publishing reuses credentials from `knack auth login`; trusted automation
+can instead provide `KNACK_PUBLISH_TOKEN` in the MCP server environment. Tokens are not
+accepted as tool arguments, so they are not exposed to the model.
+
 ## Usage
 
 Create a skill:
