@@ -293,7 +293,20 @@ Serve the index with `knack-registry`:
 knack-registry --index knack.index.toml --bind 127.0.0.1:7349
 ```
 
-Build and run the registry container:
+Run the published registry container:
+
+```bash
+docker run --rm -p 7349:7349 \
+  -v "$PWD:/data:ro" \
+  ghcr.io/ajac-zero/knack-registry:<version>
+```
+
+Pin a deployment to a specific release tag (or, for maximum immutability, its image
+digest). For example, the `knack-registry-v0.3.1` release publishes the `0.3.1` tag.
+`latest` tracks the most recent `knack-registry` release. Published images support
+`linux/amd64` and `linux/arm64`.
+
+Build from source instead when running unreleased or locally modified code:
 
 ```bash
 docker build -t knack-registry .
@@ -302,7 +315,7 @@ docker run --rm -p 7349:7349 \
   knack-registry
 ```
 
-The image defaults to:
+Both the published and locally built images default to:
 
 ```bash
 knack-registry \
