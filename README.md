@@ -11,7 +11,34 @@ The current v0 focuses on local skill authoring and distribution primitives. See
 
 ## Install
 
-Install the CLI from crates.io:
+Install the prebuilt CLI on macOS or Linux (no Rust toolchain required):
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://raw.githubusercontent.com/ajac-zero/knack/main/scripts/install.sh | sh
+```
+
+The installer verifies the release archive SHA-256 checksum and installs to
+`~/.local/bin` by default. Set `KNACK_VERSION` to install a specific version or
+`KNACK_INSTALL_DIR` to choose another location:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://raw.githubusercontent.com/ajac-zero/knack/main/scripts/install.sh \
+  | KNACK_VERSION=0.3.1 KNACK_INSTALL_DIR=/usr/local/bin sh
+```
+
+Prebuilt archives for Linux (x86_64 and ARM64), macOS (Intel and Apple Silicon),
+and Windows are available on the [GitHub Releases](https://github.com/ajac-zero/knack/releases)
+page. Each archive has a matching `.sha256` checksum file.
+
+If you have Cargo, `cargo-binstall` downloads those same prebuilt archives:
+
+```bash
+cargo binstall knack
+```
+
+Install the CLI from crates.io as a source-build fallback:
 
 ```bash
 cargo install knack
@@ -21,6 +48,12 @@ Install the registry server:
 
 ```bash
 cargo install knack-registry
+```
+
+Or download its prebuilt artifact with `cargo-binstall`:
+
+```bash
+cargo binstall knack-registry
 ```
 
 Or build both from source:
