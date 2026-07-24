@@ -16,6 +16,11 @@ categories = ["command-line-utilities", "development-tools"]
 name = "knack"
 path = "src/main.rs"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/{ name }-v{ version }/{ name }-{ version }-{ target }{ archive-suffix }"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
 [dependencies]
 anstream = "1.0.0"
 anstyle = "1.0.13"

@@ -12,6 +12,11 @@ readme = "../README.md"
 keywords = ["agent", "ai", "skill", "registry", "server"]
 categories = ["command-line-utilities", "web-programming::http-server"]
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/{ name }-v{ version }/{ name }-{ version }-{ target }{ archive-suffix }"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
 [dependencies]
 anyhow = "1.0.98"
 axum = "0.8.7"
