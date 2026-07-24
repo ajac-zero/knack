@@ -44,3 +44,14 @@ jobs:
             | while IFS= read -r tag; do
                 gh workflow run publish-binaries.yml --ref main -f "tag=$tag"
               done
+
+      - name: Publish registry image
+        if: steps.release-plz.outputs.releases_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          echo "$RELEASES" | jq -r '.[] | select(.package_name == "knack-registry") | .tag' \
+            | while IFS= read -r tag; do
+                gh workflow run publish-registry-image.yml --ref main -f "tag=$tag"
+              done
