@@ -960,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "knack"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anstream",
  "anstyle",
@@ -984,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "knack-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "flate2",
@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "knack-registry"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1019,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "knack-search-wasm"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "knack-core",
  "serde_json",

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/ajac-zero/knack/compare/knack-core-v0.3.1...knack-core-v0.4.0) - 2026-07-24
+
+### Added
+
+- *(cli)* expose skill workflows over MCP
+- *(registry)* add OIDC publisher attribution
+- *(registry)* add horizontally scalable Postgres backend
+- *(cli)* publish skills directly to HTTP registries
+- *(core)* add shared skill archive create/unpack helpers
+- *(cli)* inspect skill metadata and contents
+
+### Other
+
+- publish prebuilt binary releases
+- *(registry)* publish container image to GHCR
+- remove stale static registry roadmap item
+
 ## [0.3.1](https://github.com/ajac-zero/knack/compare/knack-core-v0.3.0...knack-core-v0.3.1) - 2026-07-10
 
 ### Added
